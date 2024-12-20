@@ -6,9 +6,10 @@ import numpy as np
 
 # given img1, points1 and img2, return the matched points2 in img2
 class FeatMatchNN(nn.Module):
-    """ Feature Matching Neural Network
+    """Feature Matching Neural Network
     Note: all input and output are torch.Tensor
     """
+
     def __init__(self):
         super(FeatMatchNN, self).__init__()
         c1, c2, c3, c4 = 3, 8, 16, 32
@@ -38,7 +39,8 @@ class FeatMatchNN(nn.Module):
         x1, x2: (3, H, W), elements in [0, 1] instead of [0, 255]
         pts1: (B, 2)
         return
-            conf: (B, H, W), valid: (B, )
+            conf: (B, H, W), confidence map of x2, elements in (-inf, inf)
+            valid: (B, ), boolean tensor
         """
         h1, h2 = x1.clone().detach(), x2.clone().detach()
         pts = pts1.clone().detach()
@@ -57,10 +59,12 @@ class FeatMatchNN(nn.Module):
             h2 = F.max_pool2d(h2, 2)
             pts = pts // 2
 
-        for layer in self.conv_dec:
+        for i, layer in enumerate(self.conv_dec):
             attn = attns.pop()
             # h2: ([B, ]Ci, Hi, Wi), attn: (B, 1, Hi, Wi)
-            h2 = F.relu(layer(h2) * attn)
+            h2 = layer(h2) * attn
+            if i < len(self.conv_dec) - 1:
+                h2 = F.relu(h2)
         # h2: (B, 1, H, W)
         conf = h2.squeeze(1)
         valid = torch.max(conf.view(B, -1), dim=1)[0] > 1
@@ -82,7 +86,7 @@ class FeatMatchNN(nn.Module):
         return pts2, valid
 
     def loss(self, x1, x2, pts1, pts2, valid2, cld2):
-        """
+        """argmax the confidence map and calculate the distance
         x1, x2: (3, H, W), elements in [0, 1] instead of [0, 255]
         pts1, pts2: (B, 2)
         valid2: (B, )
@@ -92,13 +96,30 @@ class FeatMatchNN(nn.Module):
         """
         B = pts1.shape[0]
         conf_pred, valid_pred = self.forward(x1, x2, pts1)
+        # Note: argmax differentiable problem?
         pts2_pred = self.conf2pts(conf_pred)
         pts2_3d_pred = cld2[pts2_pred[:, 0], pts2_pred[:, 1]] * valid_pred.view(B, 1)
         pts2_3d = cld2[pts2[:, 0], pts2[:, 1]] * valid2.view(B, 1)
         return torch.mean(torch.norm(pts2_3d_pred - pts2_3d, dim=1))
 
-    def pts2conf(self, pts, valid, H, W):
+    def loss2(self, x1, x2, pts1, pts2, valid2, cld2):
+        """softmax the confidence map and calculate weighted sum of distances
+        x1, x2: (3, H, W), elements in [0, 1] instead of [0, 255]
+        pts1, pts2: (B, 2)
+        valid2: (B, )
+        cld2: (H, W, 3)
+        return
+            loss: scalar
         """
+        B = pts1.shape[0]
+        pts2_3d = cld2[pts2[:, 0], pts2[:, 1]] * valid2.view(B, 1)
+        conf_pred, _ = self.forward(x1, x2, pts1)
+        # dist: (B, H*W)
+        dist = torch.norm(pts2_3d.view(B, 1, 3) - cld2.view(1, -1, 3), dim=-1)
+        return torch.sum(torch.softmax(conf_pred.view(B, -1), dim=1) * dist) / B
+
+    def pts2conf(self, pts, valid, H, W):
+        """generate confidence map from points and valid
         pts: (B, 2), valid: (B, )
         return
             conf: (B, H, W)
@@ -110,7 +131,7 @@ class FeatMatchNN(nn.Module):
         return conf
 
     def conf2pts(self, conf):
-        """
+        """get the most confident points' indices
         conf: (B, H, W)
         return
             pts: (B, 2)
@@ -123,14 +144,17 @@ class FeatMatchNN(nn.Module):
 
 
 def main():
+    # Note: ensure that L is power of 2
+    L = 16
+    B = 10
     model = FeatMatchNN()
-    x1 = torch.rand(3, 128, 128)
-    x2 = torch.rand(3, 128, 128)
-    pts1 = torch.randint(0, 128, (10, 2))
-    pts2 = torch.randint(0, 128, (10, 2))
-    valid2 = torch.rand(10) > 0.5
-    cld2 = torch.rand(128, 128, 3)
-    loss = model.loss(x1, x2, pts1, pts2, valid2, cld2)
+    x1 = torch.rand(3, L, L)
+    x2 = torch.rand(3, L, L)
+    pts1 = torch.randint(0, L, (B, 2))
+    pts2 = torch.randint(0, L, (B, 2))
+    valid2 = torch.rand(B) > 0.5
+    cld2 = torch.rand(L, L, 3)
+    loss = model.loss2(x1, x2, pts1, pts2, valid2, cld2)
     print(loss)
 
 
