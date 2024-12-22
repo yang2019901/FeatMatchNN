@@ -191,54 +191,78 @@ def preprocessing():
     SP_match(imgs[0], imgs[1])
 
 
-def confirm(x0, x1, m_pts0, m_pts1):
+def confirm(x1, x2, m_pts1, m_pts2, um_pts1):
     """draw the matched points one by one and manually confirm them"""
     ratio = 4 / 3
     fig, axes = plt.subplots(1, 2, figsize=(2 * ratio * 4.5, 4.5))
-    axes[0].imshow(x0.permute(1, 2, 0).cpu().numpy())
+    axes[0].imshow(x1.permute(1, 2, 0).cpu().numpy())
     axes[0].axis("off")
-    axes[1].imshow(x1.permute(1, 2, 0).cpu().numpy())
+    axes[1].imshow(x2.permute(1, 2, 0).cpu().numpy())
     axes[1].axis("off")
-    l = m_pts0.shape[0]
-    c0 = plt.Circle((m_pts0[0, 0], m_pts0[0, 1]), 2, color="r")
-    c1 = plt.Circle((m_pts1[0, 0], m_pts1[0, 1]), 2, color="r")
+    l1 = m_pts1.shape[0]
+    l2 = um_pts1.shape[0]
+    # draw matched points
+    axes[0].scatter(m_pts1[:, 0], m_pts1[:, 1], c="g", s=4)
+    axes[1].scatter(m_pts2[:, 0], m_pts2[:, 1], c="g", s=4)
+    for i in range(l1):
+        conn = matplotlib.patches.ConnectionPatch(
+            xyA=m_pts1[i],
+            xyB=m_pts2[i],
+            coordsA=axes[0].transData,
+            coordsB=axes[1].transData,
+            color="g",
+        )
+        fig.add_artist(conn)
+    # draw unmatched points
+    axes[0].scatter(um_pts1[:, 0], um_pts1[:, 1], c="b", s=4)
+    # draw indicator
+    c1 = plt.Circle(m_pts1[0], 3, color="r")
+    c2 = plt.Circle(m_pts2[0], 3, color="r")
     conn = matplotlib.patches.ConnectionPatch(
-        xyA=(m_pts0[0, 0], m_pts0[0, 1]),
-        xyB=(m_pts1[0, 0], m_pts1[0, 1]),
+        xyA=m_pts1[0],
+        xyB=m_pts2[0],
         coordsA=axes[0].transData,
         coordsB=axes[1].transData,
         color="r",
     )
-    axes[0].add_artist(c0)
-    axes[1].add_artist(c1)
+    axes[0].add_artist(c1)
+    axes[1].add_artist(c2)
     fig.add_artist(conn)
+    # indicator and data
     idx = 0
-    valid = torch.zeros(l, dtype=torch.bool)
-    fig.suptitle(f"idx: {idx} / {l}")
+    correct = torch.zeros(l1 + l2, dtype=torch.bool)  # whether lightglue is correct
+    fig.suptitle(f"idx: {idx} / ({l1} + {l2})")
     fig.tight_layout(pad=0)
 
     def on_key(event):
-        nonlocal idx, c0, c1, conn, valid
-        # print(f"key pressed: {event.key}\tidx: {idx} / {l}")
+        """
+        n/m: next/previous point pair;
+        j/k: accept/reject the current point pair
+        """
+        nonlocal idx, c1, c2, conn, correct
         if event.key == "q":
             plt.close()
             return
-        # n, m to change to next or previous point pair
-        # j, k to accept or reject the current point pair
-        valid[idx] = 1 if event.key == "j" else (0 if event.key == "k" else valid[idx])
+        correct[idx] = (
+            1 if event.key == "j" else (0 if event.key == "k" else correct[idx])
+        )
         # change idx
         if event.key == "n" or event.key == "j" or event.key == "k":
             idx += 1
         elif event.key == "m" and idx > 0:
             idx -= 1
-        if idx >= l:
+        if idx >= l1 + l2:
             plt.close()
             return
-        fig.suptitle(f"idx: {idx} / {l}")
-        c0.center = (m_pts0[idx, 0], m_pts0[idx, 1])
-        c1.center = (m_pts1[idx, 0], m_pts1[idx, 1])
-        conn.xy1 = (m_pts0[idx, 0], m_pts0[idx, 1])
-        conn.xy2 = (m_pts1[idx, 0], m_pts1[idx, 1])
+        # update drawing
+        fig.suptitle(f"idx: {idx} / ({l1} + {l2})")
+        c1.center = m_pts1[idx] if idx < l1 else um_pts1[idx - l1]
+        c2.set_visible(idx < l1)
+        conn.set_visible(idx < l1)
+        if idx < l1:
+            c2.center = m_pts2[idx]
+            conn.xy1 = m_pts1[idx]
+            conn.xy2 = m_pts2[idx]
         fig.canvas.draw()
 
     fig.canvas.mpl_connect(
@@ -246,14 +270,18 @@ def confirm(x0, x1, m_pts0, m_pts1):
         on_key,
     )
     plt.show()
-    print("confirmed valid: ", valid)
-    return m_pts0[valid], m_pts1[valid]
+    print("lightglue correct: ", correct)
+    return correct[:l1], correct[l1:]
 
 
-def SP_match(x0, x1):
+def SP_match(x1, x2):
     """match two images using SuperPoint and LightGlue
     ---
-    x0, x1: (3, H, W), elements in [0, 1] instead of [0, 255]
+    x1, x2: (3, H, W), elements in [0, 1] instead of [0, 255]
+
+    return:
+        m_pts1, m_pts2: matched points in x1 and x2
+        um_pts1: unmatched points in x1
     """
     from LightGlue.lightglue import LightGlue, SuperPoint, viz2d
     from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
@@ -261,13 +289,19 @@ def SP_match(x0, x1):
     dev = torch.device("cuda:0")
     extractor = SuperPoint(max_num_keypoints=256).to(dev)
     matcher = LightGlue(features="superpoint").eval().to(dev)
-    feats0 = extractor.extract(x0.to(dev))
     feats1 = extractor.extract(x1.to(dev))
-    matches01 = matcher({"image0": feats0, "image1": feats1})
-    feats0, feats1, matches01 = rbd(feats0), rbd(feats1), rbd(matches01)
-    pts0, pts1, matches = feats0["keypoints"], feats1["keypoints"], matches01["matches"]
-    m_pts0, m_pts1 = pts0[matches[..., 0]].to("cpu"), pts1[matches[..., 1]].to("cpu")
-    m_pts0, m_pts1 = confirm(x0, x1, m_pts0, m_pts1)
+    feats2 = extractor.extract(x2.to(dev))
+    matches12 = matcher({"image0": feats1, "image1": feats2})
+    feats1, feats2, matches12 = rbd(feats1), rbd(feats2), rbd(matches12)
+    pts1, pts2, matches = (
+        feats1["keypoints"].to("cpu"),
+        feats2["keypoints"].to("cpu"),
+        matches12["matches"].to("cpu"),
+    )
+    m_pts1, m_pts2 = pts1[matches[..., 0]].to(torch.int), pts2[matches[..., 1]].to(torch.int)
+    um_pts1 = pts1[[i for i in range(len(pts1)) if i not in matches[..., 0]]][:30].to(torch.int)
+    correct_m, correct_um = confirm(x1, x2, m_pts1, m_pts2, um_pts1)
+    return m_pts1[correct_m], m_pts2[correct_m], um_pts1[correct_um]
 
 
 def main():
