@@ -1,7 +1,10 @@
+import matplotlib.patches
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
 
 
 # given img1, points1 and img2, return the matched points2 in img2
@@ -182,6 +185,91 @@ class FeatMatchNN(nn.Module):
         return pts
 
 
+def preprocessing():
+    imgs, clds = torch.load("carbinet.dat")
+    imgs = imgs.permute(0, 3, 1, 2)  # (B, H, W, 3) -> (B, 3, H, W), range [0, 1]
+    SP_match(imgs[0], imgs[1])
+
+
+def confirm(x0, x1, m_pts0, m_pts1):
+    """draw the matched points one by one and manually confirm them"""
+    ratio = 4 / 3
+    fig, axes = plt.subplots(1, 2, figsize=(2 * ratio * 4.5, 4.5))
+    axes[0].imshow(x0.permute(1, 2, 0).cpu().numpy())
+    axes[0].axis("off")
+    axes[1].imshow(x1.permute(1, 2, 0).cpu().numpy())
+    axes[1].axis("off")
+    l = m_pts0.shape[0]
+    c0 = plt.Circle((m_pts0[0, 0], m_pts0[0, 1]), 2, color="r")
+    c1 = plt.Circle((m_pts1[0, 0], m_pts1[0, 1]), 2, color="r")
+    conn = matplotlib.patches.ConnectionPatch(
+        xyA=(m_pts0[0, 0], m_pts0[0, 1]),
+        xyB=(m_pts1[0, 0], m_pts1[0, 1]),
+        coordsA=axes[0].transData,
+        coordsB=axes[1].transData,
+        color="r",
+    )
+    axes[0].add_artist(c0)
+    axes[1].add_artist(c1)
+    fig.add_artist(conn)
+    idx = 0
+    valid = torch.zeros(l, dtype=torch.bool)
+    fig.suptitle(f"idx: {idx} / {l}")
+    fig.tight_layout(pad=0)
+
+    def on_key(event):
+        nonlocal idx, c0, c1, conn, valid
+        # print(f"key pressed: {event.key}\tidx: {idx} / {l}")
+        if event.key == "q":
+            plt.close()
+            return
+        # n, m to change to next or previous point pair
+        # j, k to accept or reject the current point pair
+        valid[idx] = 1 if event.key == "j" else (0 if event.key == "k" else valid[idx])
+        # change idx
+        if event.key == "n" or event.key == "j" or event.key == "k":
+            idx += 1
+        elif event.key == "m" and idx > 0:
+            idx -= 1
+        if idx >= l:
+            plt.close()
+            return
+        fig.suptitle(f"idx: {idx} / {l}")
+        c0.center = (m_pts0[idx, 0], m_pts0[idx, 1])
+        c1.center = (m_pts1[idx, 0], m_pts1[idx, 1])
+        conn.xy1 = (m_pts0[idx, 0], m_pts0[idx, 1])
+        conn.xy2 = (m_pts1[idx, 0], m_pts1[idx, 1])
+        fig.canvas.draw()
+
+    fig.canvas.mpl_connect(
+        "key_press_event",
+        on_key,
+    )
+    plt.show()
+    print("confirmed valid: ", valid)
+    return m_pts0[valid], m_pts1[valid]
+
+
+def SP_match(x0, x1):
+    """match two images using SuperPoint and LightGlue
+    ---
+    x0, x1: (3, H, W), elements in [0, 1] instead of [0, 255]
+    """
+    from LightGlue.lightglue import LightGlue, SuperPoint, viz2d
+    from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
+
+    dev = torch.device("cuda:0")
+    extractor = SuperPoint(max_num_keypoints=256).to(dev)
+    matcher = LightGlue(features="superpoint").eval().to(dev)
+    feats0 = extractor.extract(x0.to(dev))
+    feats1 = extractor.extract(x1.to(dev))
+    matches01 = matcher({"image0": feats0, "image1": feats1})
+    feats0, feats1, matches01 = rbd(feats0), rbd(feats1), rbd(matches01)
+    pts0, pts1, matches = feats0["keypoints"], feats1["keypoints"], matches01["matches"]
+    m_pts0, m_pts1 = pts0[matches[..., 0]].to("cpu"), pts1[matches[..., 1]].to("cpu")
+    m_pts0, m_pts1 = confirm(x0, x1, m_pts0, m_pts1)
+
+
 def main():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
@@ -199,4 +287,5 @@ def main():
     print(loss)
 
 
-main()
+# main()
+preprocessing()
