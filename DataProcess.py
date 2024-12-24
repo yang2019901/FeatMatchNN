@@ -123,7 +123,8 @@ def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
     return correct[:l1], correct[l1:]
 
 
-def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, dist_thresh=0.02):
+# Note: distance noise gets larger when obj is further, here we use a ratio `k_tol`: (p1 - p2) < (norm(p1) + norm(p2)) * k_tol
+def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, k_tol=0.03):
     """generate boolean mask of matched points, using distance threshold
     ---
     m_pts1, m_pts2: (L1, 2), int
@@ -134,21 +135,23 @@ def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, dist_thresh=0.02):
         matched: (L1, ), bool
         um_matched: (L2, ), bool
     """
-    dist1 = torch.norm(
+    dist1 = torch.norm(cld1_glb, dim=-1)  # (H, W)
+    dist2 = torch.norm(cld2_glb, dim=-1)  # (H, W)
+    err1 = torch.norm(
         cld1_glb[m_pts1[:, 1], m_pts1[:, 0]] - cld2_glb[m_pts2[:, 1], m_pts2[:, 0]],
         dim=-1,
     )
-    matched = dist1 < dist_thresh
-    print(dist1)
+    err1_tol = dist1[m_pts1[:, 1], m_pts1[:, 0]] + dist2[m_pts2[:, 1], m_pts2[:, 0]]
+    matched = err1 < err1_tol * k_tol
     if um_pts1 is None:
         return matched, None
-    dist2 = torch.norm(
+    err2 = torch.norm(
         cld1_glb[um_pts1[:, 1], um_pts1[:, 0]].view(-1, 1, 3) - cld2_glb.view(1, -1, 3),
         dim=-1,
     )  # (L2, H*W)
-    dist2 = torch.min(dist2, dim=-1)[0]
-    um_matched = dist2 > dist_thresh
-    return matched, um_matched
+    err2_tol = dist1[um_pts1[:, 1], um_pts1[:, 0]].view(-1, 1) + dist2.view(1, -1)
+    unmatched = torch.min(err2 / err2_tol, dim=-1)[0] > k_tol
+    return matched, unmatched
 
 
 def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
@@ -164,13 +167,15 @@ def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
     """
     L1, L2 = m_pts1.shape[0], um_pts1.shape[0]
     assert L1 + L2 >= L
-    l1 = min(int(k_valid * L), L1)
+    l1 = max(min(int(k_valid * L), L1), L - L2)
     l2 = L - l1
     idx_m = torch.randperm(L1)[:l1]
     idx_um = torch.randperm(L2)[:l2]
     pts1 = torch.cat([m_pts1[idx_m], um_pts1[idx_um]], dim=0)
     pts2 = torch.cat([m_pts2[idx_m], torch.zeros(l2, 2, dtype=torch.int)], dim=0)
-    valid2 = torch.cat([torch.ones(l1, dtype=torch.bool), torch.zeros(l2, dtype=torch.bool)])
+    valid2 = torch.cat(
+        [torch.ones(l1, dtype=torch.bool), torch.zeros(l2, dtype=torch.bool)]
+    )
     print("match, unmatch: ", (l1, l2))
     return pts1, pts2, valid2
 
@@ -223,7 +228,7 @@ if __name__ == "__main__":
     li = MakeDataset(imgs, clds, poses, L=100)
     data = li[1]
     viz2d.plot_images((data[0], data[1]))
-    viz2d.plot_matches(data[2][data[4]], data[3][data[4]], color='lime', lw=0.4)
+    viz2d.plot_matches(data[2][data[4]], data[3][data[4]], color="lime", lw=0.4)
     viz2d.plot_keypoints([data[2][~data[4]], data[3][~data[4]]], ps=6)
     plt.show()
     torch.save(li, "dataset/eggbox.pt")
