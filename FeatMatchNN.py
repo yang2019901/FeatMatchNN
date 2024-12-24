@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from torch.utils.data import DataLoader
+from torchvision.transforms import v2
+import os
 
 
 # given img1, points1 and img2, return the matched points2 in img2
@@ -190,10 +192,48 @@ class FeatMatchNN(nn.Module):
         return pts
 
 
+def viz_frame(frame):
+    from DataProcess import viz_frame
+
+    viz_frame(frame)
+
+
+class FeatMatchDataset(torch.utils.data.Dataset):
+    def __init__(self, frames, transforms=None):
+        self.frames = frames
+        self.transforms = v2.Compose(
+            [
+                v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+                v2.GaussianBlur(3),
+                v2.GaussianNoise(mean=0, sigma=0.03),
+            ]
+        )
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, idx):
+        x1, x2, pts1, pts2, valid2, cld2 = self.frames[idx]
+        if self.transforms:
+            x1, x2 = self.transforms(torch.stack([x1, x2]))
+        return x1, x2, pts1, pts2, valid2, cld2
+
+
+def make_data():
+    # load data
+    dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
+    frames = []
+    for f in os.listdir(dataset_dir):
+        frames += torch.load(f"{dataset_dir}/{f}", weights_only=True)
+    # create dataset
+    dataset = FeatMatchDataset(frames)
+    # create dataloader
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
+
 def main():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
-    H = W = 8
+    H = W = 128
     L = 2
     B = 1
     model = FeatMatchNN()
@@ -208,4 +248,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    make_data()

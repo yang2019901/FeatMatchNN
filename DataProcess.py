@@ -3,6 +3,7 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib
 import open3d as o3d
+import os
 
 from LightGlue.lightglue import LightGlue, SuperPoint, viz2d
 from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
@@ -183,6 +184,9 @@ def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
 def MakeDataset(imgs, clds, poses, L):
     """assume imgs/clds[0] is object image, imgs/clds[1:] are scene images.
     extract `L` point pairs from each scene image and the object image.
+
+    return:
+        frames: list of N-1 frame. frame format: (x1, x2, pts1, pts2, valid2, cld2)
     """
     imgs = torch.tensor(imgs, dtype=torch.uint8)
     clds = torch.tensor(clds, dtype=torch.float32)
@@ -196,7 +200,7 @@ def MakeDataset(imgs, clds, poses, L):
     matcher = LightGlue(features="superpoint").eval().to(dev)
     feats = [extractor.extract(X[i].to(dev)) for i in range(N)]
     # match
-    li = []
+    frames = []
     for i in range(1, N):
         feat1, cld1, pose1 = feats[0], clds[0], poses[0]
         feat2, cld2, pose2 = feats[i], clds[i], poses[i]
@@ -218,17 +222,25 @@ def MakeDataset(imgs, clds, poses, L):
         pts1, pts2, valid2 = sample(
             m_pts1[correct_m], m_pts2[correct_m], um_pts1[correct_um], L
         )
-        li.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
+        frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
     print(f"{N-1} pairs of images are processed.")
-    return li
+    return frames
+
+
+def viz_frame(frame):
+    x1, x2, pts1, pts2, valid2, cld2 = frame
+    viz2d.plot_images((x1, x2))
+    viz2d.plot_matches(pts1[valid2], pts2[valid2], color="lime", lw=0.4)
+    viz2d.plot_keypoints([pts1[~valid2], ], ps=6)
+    plt.show()
 
 
 if __name__ == "__main__":
-    imgs, clds, poses = torch.load("raw/eggbox.pt")
-    li = MakeDataset(imgs, clds, poses, L=100)
-    data = li[1]
-    viz2d.plot_images((data[0], data[1]))
-    viz2d.plot_matches(data[2][data[4]], data[3][data[4]], color="lime", lw=0.4)
-    viz2d.plot_keypoints([data[2][~data[4]], data[3][~data[4]]], ps=6)
-    plt.show()
-    torch.save(li, "dataset/eggbox.pt")
+    raw_dir = os.path.join(os.path.dirname(__file__), "raw")
+    dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
+    for f in os.listdir(raw_dir):
+        print(f"processing {f}")
+        imgs, clds, poses = torch.load(f"{raw_dir}/{f}", weights_only=True)
+        li = MakeDataset(imgs, clds, poses, L=100)
+        torch.save(li, f"{dataset_dir}/{f}")
+    viz_frame(li[-1])
