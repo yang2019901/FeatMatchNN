@@ -139,6 +139,7 @@ def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, dist_thresh=0.02):
         dim=-1,
     )
     matched = dist1 < dist_thresh
+    print(dist1)
     if um_pts1 is None:
         return matched, None
     dist2 = torch.norm(
@@ -150,50 +151,79 @@ def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, dist_thresh=0.02):
     return matched, um_matched
 
 
-def SP_match(x1, x2, cld1, cld2, pose1, pose2):
-    """match two images using SuperPoint and LightGlue
+def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
+    """sample L point pairs from matched points and unmatched points
     ---
-    x1, x2: (3, H, W), elements in [0, 1] instead of [0, 255]
-    cld1, cld2: (H, W, 3), float32
-    pose1, pose2: [[x, y, z], [qx, qy, qz, qw]]; cam1 and cam2's pose in the reference frame
+    m_pts1, m_pts2: (L1, 2), int
+    um_pts1: (L2, 2), int
+    L: int
 
     return:
-        m_pts1, m_pts2: matched points in x1 and x2
-        um_pts1: unmatched points in x1
+        pts1, pts2: (L, 2), int
+        valid2: (L, ), bool
     """
-    dev = torch.device("cuda:0")
-    extractor = SuperPoint(max_num_keypoints=256).to(dev)
-    matcher = LightGlue(features="superpoint").eval().to(dev)
-    feats1 = extractor.extract(x1.to(dev))
-    feats2 = extractor.extract(x2.to(dev))
-    matches12 = matcher({"image0": feats1, "image1": feats2})
-    feats1, feats2, matches12 = rbd(feats1), rbd(feats2), rbd(matches12)
-    pts1, pts2, matches = (
-        feats1["keypoints"].to("cpu"),
-        feats2["keypoints"].to("cpu"),
-        matches12["matches"].to("cpu"),
-    )
-    m_pts1, m_pts2 = pts1[matches[..., 0]].to(torch.int), pts2[matches[..., 1]].to(
-        torch.int
-    )
-    um_pts1 = pts1[[i for i in range(len(pts1)) if i not in matches[..., 0]]].to(
-        torch.int
-    )
-    cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
-    correct_m, correct_um = autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb)
-    return m_pts1[correct_m], m_pts2[correct_m], um_pts1[correct_um]
+    L1, L2 = m_pts1.shape[0], um_pts1.shape[0]
+    assert L1 + L2 >= L
+    l1 = min(int(k_valid * L), L1)
+    l2 = L - l1
+    idx_m = torch.randperm(L1)[:l1]
+    idx_um = torch.randperm(L2)[:l2]
+    pts1 = torch.cat([m_pts1[idx_m], um_pts1[idx_um]], dim=0)
+    pts2 = torch.cat([m_pts2[idx_m], torch.zeros(l2, 2, dtype=torch.int)], dim=0)
+    valid2 = torch.cat([torch.ones(l1, dtype=torch.bool), torch.zeros(l2, dtype=torch.bool)])
+    print("match, unmatch: ", (l1, l2))
+    return pts1, pts2, valid2
 
 
-def main():
-    imgs, clds, poses = torch.load("carbinet.dat")
+def MakeDataset(imgs, clds, poses, L):
+    """assume imgs/clds[0] is object image, imgs/clds[1:] are scene images.
+    extract `L` point pairs from each scene image and the object image.
+    """
     imgs = torch.tensor(imgs, dtype=torch.uint8)
     clds = torch.tensor(clds, dtype=torch.float32)
     X = (
-        imgs.permute(0, 3, 1, 2) / 255
-    )  # (B, H, W, 3) -> (B, 3, H, W), range: [0, 255] -> [0, 1]
-
-    SP_match(X[0], X[1], clds[0], clds[1], poses[0], poses[1])
+        imgs.permute(0, 3, 1, 2) / 255.0
+    )  # (N, H, W, 3) -> (N, 3, H, W), range: [0, 255] -> [0, 1]
+    N, _, H, W = X.shape
+    # extract features
+    dev = torch.device("cuda:0")
+    extractor = SuperPoint(max_num_keypoints=4 * L).to(dev)
+    matcher = LightGlue(features="superpoint").eval().to(dev)
+    feats = [extractor.extract(X[i].to(dev)) for i in range(N)]
+    # match
+    li = []
+    for i in range(1, N):
+        feat1, cld1, pose1 = feats[0], clds[0], poses[0]
+        feat2, cld2, pose2 = feats[i], clds[i], poses[i]
+        matches12 = matcher({"image0": feat1, "image1": feat2})
+        feat1, feat2, matches12 = rbd(feat1), rbd(feat2), rbd(matches12)
+        pts1, pts2, matches = (
+            feat1["keypoints"].to("cpu"),
+            feat2["keypoints"].to("cpu"),
+            matches12["matches"].to("cpu"),
+        )
+        m_pts1, m_pts2 = pts1[matches[..., 0]].to(torch.int), pts2[matches[..., 1]].to(
+            torch.int
+        )
+        um_pts1 = pts1[[i for i in range(len(pts1)) if i not in matches[..., 0]]].to(
+            torch.int
+        )
+        cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
+        correct_m, correct_um = autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb)
+        pts1, pts2, valid2 = sample(
+            m_pts1[correct_m], m_pts2[correct_m], um_pts1[correct_um], L
+        )
+        li.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
+    print(f"{N-1} pairs of images are processed.")
+    return li
 
 
 if __name__ == "__main__":
-    main()
+    imgs, clds, poses = torch.load("raw/eggbox.pt")
+    li = MakeDataset(imgs, clds, poses, L=100)
+    data = li[1]
+    viz2d.plot_images((data[0], data[1]))
+    viz2d.plot_matches(data[2][data[4]], data[3][data[4]], color='lime', lw=0.4)
+    viz2d.plot_keypoints([data[2][~data[4]], data[3][~data[4]]], ps=6)
+    plt.show()
+    torch.save(li, "dataset/eggbox.pt")
