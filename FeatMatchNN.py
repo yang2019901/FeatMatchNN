@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
+from torchinfo import summary
 import os
 
 
@@ -69,7 +70,7 @@ class FeatMatchNN(nn.Module):
                 (pts[:, :, 0] * Wi + pts[:, :, 1]).unsqueeze(1).expand(-1, Ci, -1),
             )
             attn = F.softmax(
-                torch.einsum("bchw,bcl->bhwl", h2, Q).view(B, L, -1), dim=-1
+                torch.einsum("bchw,bcl->blhw", h2, Q).view(B, L, -1), dim=-1
             ).view(B * L, 1, Hi, Wi)
             attns.append(attn)
             h1 = F.max_pool2d(h1, 2)
@@ -200,8 +201,16 @@ def viz_frame(frame):
 
 
 class FeatMatchDataset(torch.utils.data.Dataset):
-    def __init__(self, frames, transforms=None):
-        self.frames = frames
+    def __init__(self, frames, H=None, W=None, dev=None):
+        self.x1, self.x2, self.pts1, self.pts2, self.valid2, self.cld2 = zip(*frames)
+        self.x1 = torch.stack(self.x1).to(dev)
+        self.x2 = torch.stack(self.x2).to(dev)
+        self.pts1 = torch.stack(self.pts1).to(dev)
+        self.pts2 = torch.stack(self.pts2).to(dev)
+        self.valid2 = torch.stack(self.valid2).to(dev)
+        self.cld2 = torch.stack(self.cld2).to(dev)
+        self.H = frames[0][0].shape[-2] if H is None else H
+        self.W = frames[0][0].shape[-1] if W is None else W
         self.transforms = v2.Compose(
             [
                 v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
@@ -211,16 +220,28 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         )
 
     def __len__(self):
-        return len(self.frames)
+        return len(self.x1)
 
     def __getitem__(self, idx):
-        x1, x2, pts1, pts2, valid2, cld2 = self.frames[idx]
-        if self.transforms:
-            x1, x2 = self.transforms(torch.stack([x1, x2]))
+        x1, x2, pts1, pts2, valid2, cld2 = self.x1[idx], self.x2[idx], self.pts1[idx], self.pts2[idx], self.valid2[idx], self.cld2[idx]
+        H0, W0 = x1.shape[-2:]
+        x1, x2, cld2 = v2.functional.resize(
+            torch.stack([x1, x2, cld2.permute(2, 0, 1)]), (self.H, self.W)
+        )
+        cld2 = cld2.permute(1, 2, 0)
+        # Note: the same transform for x1 and x2
+        x1, x2 = self.transforms(torch.stack([x1, x2]))
+        if self.H != H0:
+            pts1[..., 0] = pts1[..., 0] * self.H // H0
+            pts2[..., 0] = pts2[..., 0] * self.H // H0
+        if self.W != W0:
+            pts1[..., 1] = pts1[..., 1] * self.W // W0
+            pts2[..., 1] = pts2[..., 1] * self.W // W0
         return x1, x2, pts1, pts2, valid2, cld2
 
 
 def main():
+    dev = torch.device("cuda")
     # load data
     dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
     frames = []
@@ -228,41 +249,42 @@ def main():
         frames += torch.load(f"{dataset_dir}/{f}", weights_only=True)
         print(f"{f} loaded.")
     # create dataset
-    dataset = FeatMatchDataset(frames)
+    dataset = FeatMatchDataset(frames, H=128, W=128, dev=dev)
     # create dataloader
-    dataloader = DataLoader(
-        dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True
-    )
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     # create model
-    model = FeatMatchNN()
+    model = FeatMatchNN().to(dev)
     # train
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=10)
     for epoch in range(1000):
         optimizer.zero_grad()
         for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
             loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
             loss.backward()
         optimizer.step()
-        if epoch % 100 == 0:
-            print(f"epoch {epoch} loss: {loss.item()}")
+        print(f"epoch {epoch} loss: {loss.item()}")
 
 
 def test():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
-    H = W = 128
-    L = 2
+    H, W = 256, 256
+    L = 10
     B = 1
     model = FeatMatchNN()
-    x1 = torch.rand(B, 3, H, H)
-    x2 = torch.rand(B, 3, H, H)
-    pts1 = torch.randint(0, H, (B, L, 2))
-    pts2 = torch.randint(0, H, (B, L, 2))
+    x1 = torch.rand(B, 3, H, W)
+    x2 = torch.rand(B, 3, H, W)
+    pts_x = torch.randint(0, H, (B, L, 2))
+    pts_y = torch.randint(0, W, (B, L, 2))
+    pts1 = torch.stack([pts_x[..., 0], pts_y[..., 0]], dim=-1)
+    pts2 = torch.stack([pts_x[..., 1], pts_y[..., 1]], dim=-1)
     valid2 = torch.rand(B, L) > 0.5
-    cld2 = torch.rand(B, H, H, 3)
-    loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
-    print(loss)
+    cld2 = torch.rand(B, H, W, 3)
+    summary(model, input_data=(x1, x2, pts1))
+    # loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
+    # print(loss)
 
 
 if __name__ == "__main__":
     main()
+    # test()
