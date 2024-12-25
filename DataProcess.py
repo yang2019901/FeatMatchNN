@@ -206,22 +206,23 @@ def MakeDataset(imgs, clds, poses, L):
         feat2, cld2, pose2 = feats[i], clds[i], poses[i]
         matches12 = matcher({"image0": feat1, "image1": feat2})
         feat1, feat2, matches12 = rbd(feat1), rbd(feat2), rbd(matches12)
-        pts1, pts2, matches = (
+        uv1, uv2, matches = (
             feat1["keypoints"].to("cpu"),
             feat2["keypoints"].to("cpu"),
             matches12["matches"].to("cpu"),
         )
-        m_pts1, m_pts2 = pts1[matches[..., 0]].to(torch.int), pts2[matches[..., 1]].to(
-            torch.int
-        )
-        um_pts1 = pts1[[i for i in range(len(pts1)) if i not in matches[..., 0]]].to(
-            torch.int
+        m_uv1 = uv1[matches[..., 0]].to(torch.int64)
+        m_uv2 = uv2[matches[..., 1]].to(torch.int64)
+        um_uv1 = uv1[[i for i in range(len(uv1)) if i not in matches[..., 0]]].to(
+            torch.int64
         )
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
-        correct_m, correct_um = autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb)
-        pts1, pts2, valid2 = sample(
-            m_pts1[correct_m], m_pts2[correct_m], um_pts1[correct_um], L
+        correct_m, correct_um = autocheck(m_uv1, m_uv2, um_uv1, cld1_glb, cld2_glb)
+        uv1, uv2, valid2 = sample(
+            m_uv1[correct_m], m_uv2[correct_m], um_uv1[correct_um], L
         )
+        # flip last dim of uv to fit the format of torch.tensor
+        pts1, pts2 = uv1.flip([-1]), uv2.flip([-1])
         frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
     print(f"{N-1} pairs of images are processed.")
     return frames
@@ -229,9 +230,15 @@ def MakeDataset(imgs, clds, poses, L):
 
 def viz_frame(frame):
     x1, x2, pts1, pts2, valid2, cld2 = frame
+    uv1, uv2 = pts1.flip([-1]), pts2.flip([-1])
     viz2d.plot_images((x1, x2))
-    viz2d.plot_matches(pts1[valid2], pts2[valid2], color="lime", lw=0.4)
-    viz2d.plot_keypoints([pts1[~valid2], ], ps=6)
+    viz2d.plot_matches(uv1[valid2], uv2[valid2], color="lime", lw=0.4)
+    viz2d.plot_keypoints(
+        [
+            uv1[~valid2],
+        ],
+        ps=6,
+    )
     plt.show()
 
 

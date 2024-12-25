@@ -55,7 +55,7 @@ class FeatMatchNN(nn.Module):
         # copy and reshape
         h1 = x1.clone().detach().view(B, 3, H, W)
         h2 = x2.clone().detach().view(B, 3, H, W)
-        pts = pts1.clone().detach().view(B, L, 2)
+        pts = pts1.clone().detach().to(torch.int64).view(B, L, 2)
         # forward h1, h2 and pts
         attns = []
         for i, layer in enumerate(self.conv_enc):
@@ -79,9 +79,10 @@ class FeatMatchNN(nn.Module):
             pts[..., 0] = pts[..., 0] * Hi_ // Hi
             pts[..., 1] = pts[..., 1] * Wi_ // Wi
 
+        h2 = h2.repeat((L, 1, 1, 1))
         for i, layer in enumerate(self.conv_dec):
             attn = attns.pop()
-            # h2: (B[*L], Ci, Hi, Wi), attn: (B*L, 1, Hi, Wi)
+            # h2: (B*L, Ci, Hi, Wi), attn: (B*L, 1, Hi, Wi)
             h2 = layer(h2) * attn
             if i < len(self.conv_dec) - 1:
                 h2 = F.leaky_relu(h2)
@@ -108,7 +109,7 @@ class FeatMatchNN(nn.Module):
         pts2 = self.conf2pts(conf, valid, H, W)
         return pts2, valid
 
-    def loss(self, x1, x2, pts1, pts2, valid2, cld2):
+    def p2p_loss(self, x1, x2, pts1, pts2, valid2, cld2):
         """argmax the confidence map and calculate the distance
         ---
         x1, x2: (B, 3, H, W), elements in [0, 1] instead of [0, 255]
@@ -136,7 +137,7 @@ class FeatMatchNN(nn.Module):
         )  # (B, L, 3)
         return torch.mean(torch.norm(pts2_3d_pred - pts2_3d, dim=-1))
 
-    def loss2(self, x1, x2, pts1, pts2, valid2, cld2):
+    def p2map_loss(self, x1, x2, pts1, pts2, valid2, cld2):
         """softmax the confidence map and calculate weighted sum of distances
         ---
         x1, x2: (B, 3, H, W), elements in [0, 1] instead of [0, 255]
@@ -219,18 +220,34 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         return x1, x2, pts1, pts2, valid2, cld2
 
 
-def make_data():
+def main():
     # load data
     dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
     frames = []
     for f in os.listdir(dataset_dir):
         frames += torch.load(f"{dataset_dir}/{f}", weights_only=True)
+        print(f"{f} loaded.")
     # create dataset
     dataset = FeatMatchDataset(frames)
     # create dataloader
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(
+        dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True
+    )
+    # create model
+    model = FeatMatchNN()
+    # train
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for epoch in range(1000):
+        optimizer.zero_grad()
+        for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
+            loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
+            loss.backward()
+        optimizer.step()
+        if epoch % 100 == 0:
+            print(f"epoch {epoch} loss: {loss.item()}")
 
-def main():
+
+def test():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
     H = W = 128
@@ -243,10 +260,9 @@ def main():
     pts2 = torch.randint(0, H, (B, L, 2))
     valid2 = torch.rand(B, L) > 0.5
     cld2 = torch.rand(B, H, H, 3)
-    loss = model.loss2(x1, x2, pts1, pts2, valid2, cld2)
+    loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
     print(loss)
 
 
 if __name__ == "__main__":
-    # main()
-    make_data()
+    main()
