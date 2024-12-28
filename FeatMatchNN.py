@@ -6,6 +6,7 @@ from torchvision.transforms import v2
 from torchinfo import summary
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable, inset_locator
 import os
 
 
@@ -16,7 +17,7 @@ def viz_frame(frame):
 
 
 class FeatMatchDataset(torch.utils.data.Dataset):
-    def __init__(self, frames, H=None, W=None, dev=None):
+    def __init__(self, frames, H=None, W=None, dev=None, augment=True):
         H0, W0 = frames[0][0].shape[-2:]
         self.H = H0 if H is None else H
         self.W = W0 if W is None else W
@@ -46,12 +47,18 @@ class FeatMatchDataset(torch.utils.data.Dataset):
             cld2,
         )
 
-        self.transforms = v2.Compose(
-            [
-                v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
-                v2.GaussianBlur(3),
-                v2.GaussianNoise(mean=0, sigma=0.03),
-            ]
+        self.transforms = (
+            v2.Compose([])
+            if not augment
+            else v2.Compose(
+                [
+                    v2.ColorJitter(
+                        brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5
+                    ),
+                    v2.GaussianBlur(3),
+                    v2.GaussianNoise(mean=0, sigma=0.03),
+                ]
+            )
         )
 
     def __len__(self):
@@ -166,7 +173,8 @@ class FeatMatchNN(nn.Module):
         logits = h2.view(B, L, H, W)
         return logits
 
-    def viz_featmap(self, featmap: torch.Tensor, title="", pts=None):
+    @staticmethod
+    def viz_featmap(featmap: torch.Tensor, title="", pts=None):
         # featmap: (H, W)
         fig, ax = plt.subplots()
         cbar = fig.colorbar(
@@ -191,51 +199,72 @@ class FeatMatchNN(nn.Module):
         axes[0].imshow(img1)
         axes[1].imshow(img2)
         img_heat = axes[1].imshow(heatmap, alpha=0.5, cmap="jet")
-        # img_heat.set_clim(0, 1)
-        cbar = fig.colorbar(img_heat, ax=axes[1], orientation="vertical")
+        # divider = make_axes_locatable(axes[1])
+        # cax = inset_locator.inset_axes(
+        #     axes[1],
+        #     width="3%",
+        #     height="100%",
+        #     loc="lower left",
+        #     bbox_to_anchor=(1.05, 0.0, 1, 1),
+        #     bbox_transform=axes[1].transAxes,
+        #     borderpad=0,
+        # )
+        # cbar = fig.colorbar(img_heat, cax=cax, orientation="vertical")
         axes[0].scatter(pt1[1], pt1[0], c="r", s=4, label="pt1")
         axes[1].scatter(pt2[1], pt2[0], c="r", s=4, label="pt2", alpha=pt2_vis)
         plt.show()
 
-    def loss_2d(self, x1, x2, pts1, pts2, valid2, cld2):
+    def loss(self, x1, x2, pts1, pts2, valid2, cld2):
         assert torch.all(valid2), "valid2 should be all True for now"
         logits = self.forward(x1, x2, pts1)
         B, L, H, W = logits.shape
-        grid = torch.meshgrid(
-            torch.arange(H, dtype=torch.float, device=x1.device),
-            torch.arange(W, dtype=torch.float, device=x1.device),
-            indexing="ij",
-        )
-        grid = torch.stack(grid, dim=-1)
-        dist = torch.norm(
-            grid.view(1, 1, H * W, 2) - pts2.view(B, L, 1, 2), dim=-1, p=1
-        )
-        dist = dist.view(B * L, -1)
-        logits = logits.view(B * L, -1)
-        loss2d = torch.sum(F.softmax(logits, dim=-1) * dist) / (B * L)
-        return loss2d
-
-    def loss_3d(self, x1, x2, pts1, pts2, valid2, cld2):
-        assert torch.all(valid2), "valid2 should be all True for now"
-        logits = self.forward(x1, x2, pts1)
-        B, L, H, W = logits.shape
+        # get distance
         cld = cld2.view(B, H * W, 3)
-        valid = valid2.view(B, L, 1)
-        pts = pts2.view(B, L, 2)
-        # pts2_3d: (B, L, 3)
-        pts2_3d = valid * cld.gather(
-            1, (pts[..., 0] * W + pts[..., 1]).unsqueeze(-1).expand(-1, -1, 3)
-        )
-        # dist: (B, L, H*W)
-        dist = torch.norm(pts2_3d.view(B, L, 1, 3) - cld.view(B, 1, H * W, 3), dim=-1)
+        idx = pts2[..., 0] * W + pts2[..., 1]
+        pts3d = cld.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
+        dist = torch.norm(cld2.view(B, 1, H*W, 3) - pts3d.view(B, L, 1, 3), dim=-1)
+        # get distribution of pts2
+        distrib = self.get_distrib(pts2, H, W, sigma=0.3, dist=dist)
+        # loss
+        loss = F.cross_entropy(logits.view(B * L, H * W), distrib.view(B * L, H * W))
+        return loss
 
-        log_softmax = F.log_softmax(logits.view(B * L, -1), dim=-1)
-        log_probs = log_softmax.gather(
-            1, (pts[..., 0] * W + pts[..., 1]).view(B * L, 1)
-        )
-        loss3d = -torch.mean(log_probs)
-
-        return loss3d
+    @staticmethod
+    def get_distrib(pts, H, W, sigma=0, dist=None):
+        """get distribution of points, sigma=0 for hard label (point distrib), >0 for soft label (Gaussian distrib).
+        pts: (d1, ..., dN, 2)
+        dist: (d1, ..., dN, H, W), distance map from each point to each pixel
+        return
+            distrib: (d1, ..., dN, H, W)
+        """
+        batch_dims = pts.shape[:-1]
+        pts = pts.view(-1, 2)
+        N = pts.shape[0]
+        dev = pts.device
+        distrib = torch.zeros(N, H, W, device=dev)
+        if sigma == 0:
+            # point distribution
+            distrib[torch.arange(N), pts[:, 0], pts[:, 1]] = 1
+        elif sigma > 0:
+            if dist is None:
+                grid = torch.meshgrid(
+                    torch.arange(H, dtype=torch.float, device=dev),
+                    torch.arange(W, dtype=torch.float, device=dev),
+                    indexing="ij",
+                )
+                grid = torch.stack(grid, dim=-1)
+                dist = torch.norm(grid.view(1, H, W, 2) - pts.view(N, 1, 1, 2), dim=-1)
+            # Gaussian distribution
+            distrib = torch.exp(-dist.view(N, H, W) / (2 * sigma**2))
+            distrib = distrib / torch.sum(distrib, dim=(1, 2), keepdim=True)
+        else:
+            raise (
+                ValueError(
+                    "sigma should be non-negative; 0 for hard label, >0 for soft label (Gaussian)"
+                )
+            )
+        pts = pts.view(*batch_dims, 2)
+        return distrib.view(*batch_dims, H, W)
 
 
 def main():
@@ -261,11 +290,12 @@ def main():
     for epoch in range(1000):
         optimizer.zero_grad()
         for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
-            loss = model.loss_2d(x1, x2, pts1, pts2, valid2, cld2)
+            loss = model.loss(x1, x2, pts1, pts2, valid2, cld2)
             loss.backward()
         optimizer.step()
-        print(f"\tepoch {epoch} loss: {loss.item():.3f}")
-        if (epoch + 1) % 50 == 0:
+        if epoch % 20 == 0:
+            print(f"\tepoch {epoch} loss: {loss.item():.5f}")
+        if (epoch + 1) % 200 == 0:
             model.visualize(x1, x2, pts1, pts2, valid2)
             torch.save(model.state_dict(), "fuck.pt")
 
