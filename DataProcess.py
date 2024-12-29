@@ -134,7 +134,7 @@ def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, k_tol=0.03):
 
     return:
         matched: (L1, ), bool
-        um_matched: (L2, ), bool
+        unmatched: (L2, ), bool
     """
     dist1 = torch.norm(cld1_glb, dim=-1)  # (H, W)
     dist2 = torch.norm(cld2_glb, dim=-1)  # (H, W)
@@ -167,7 +167,7 @@ def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
         valid2: (L, ), bool
     """
     L1, L2 = m_pts1.shape[0], um_pts1.shape[0]
-    assert L1 + L2 >= L
+    assert L1 + L2 >= L, f"insufficient keypoints: {L1} + {L2} < {L}"
     l1 = max(min(int(k_valid * L), L1), L - L2)
     l2 = L - l1
     idx_m = torch.randperm(L1)[:l1]
@@ -188,8 +188,8 @@ def MakeDataset(imgs, clds, poses, L):
     return:
         frames: list of N-1 frame. frame format: (x1, x2, pts1, pts2, valid2, cld2)
     """
-    imgs = torch.tensor(imgs, dtype=torch.uint8)
-    clds = torch.tensor(clds, dtype=torch.float32)
+    imgs = imgs.to(torch.uint8)
+    clds = clds.to(torch.float32)
     X = (
         imgs.permute(0, 3, 1, 2) / 255.0
     )  # (N, H, W, 3) -> (N, 3, H, W), range: [0, 255] -> [0, 1]
@@ -216,11 +216,18 @@ def MakeDataset(imgs, clds, poses, L):
         um_uv1 = uv1[[i for i in range(len(uv1)) if i not in matches[..., 0]]].to(
             torch.int64
         )
+        viz2d.plot_images((X[0], X[i]))
+        viz2d.plot_matches(m_uv1, m_uv2, color="lime", lw=0.4)
+        viz2d.plot_keypoints([um_uv1], ps=6)
+        plt.show()
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
         correct_m, correct_um = autocheck(m_uv1, m_uv2, um_uv1, cld1_glb, cld2_glb)
-        uv1, uv2, valid2 = sample(
-            m_uv1[correct_m], m_uv2[correct_m], um_uv1[correct_um], L
-        )
+        try:
+            uv1, uv2, valid2 = sample(
+                m_uv1[correct_m], m_uv2[correct_m], um_uv1[correct_um], L
+            )
+        except:
+            continue
         # flip last dim of uv to fit the format of torch.tensor
         pts1, pts2 = uv1.flip([-1]), uv2.flip([-1])
         frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
@@ -233,12 +240,7 @@ def viz_frame(frame):
     uv1, uv2 = pts1.flip([-1]), pts2.flip([-1])
     viz2d.plot_images((x1, x2))
     viz2d.plot_matches(uv1[valid2], uv2[valid2], color="lime", lw=0.4)
-    viz2d.plot_keypoints(
-        [
-            uv1[~valid2],
-        ],
-        ps=6,
-    )
+    viz2d.plot_keypoints([uv1[~valid2]], ps=6)
     plt.show()
 
 

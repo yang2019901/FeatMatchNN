@@ -75,7 +75,7 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         )
         # Note: the same transform for x1 and x2
         x1, x2 = self.transforms(torch.stack([x1, x2]))
-        return x1, x2, pts1[:80], pts2[:80], valid2[:80], cld2
+        return x1, x2, pts1, pts2, valid2, cld2
 
 
 # given img1, points1 and img2, return the matched points2 in img2
@@ -148,12 +148,11 @@ class FeatMatchNN(nn.Module):
             )
             attn = attn.view(B, Hi_, Wi_, L).permute(0, 3, 1, 2)  # (B, L, H, W)
 
-            # attn = torch.einsum("bchw,bcl->blhw", h2, query)
-
-            # self.viz_featmap(attn[0, 0], "attn")
-            # self.viz_featmap(h2[0, 3], "h2")
-            # self.viz_featmap(h1[0, 3], "h1", pts[0, 0])
+            # self.viz_featmap(attn[0, 90], "attn")
+            # self.viz_featmap(h2[0, 1], "h2")
+            # self.viz_featmap(h1[0, 1], "h1", pts[0, 90])
             # plt.show()
+
             self.attns[i] = attn.reshape(B * L, 1, Hi_, Wi_)
         # decode h2 with attns
         h2 = h2.repeat(L, 1, 1, 1)  # (B, Ci, Hi, Wi) -> (B*L, Ci, Hi, Wi)
@@ -214,20 +213,49 @@ class FeatMatchNN(nn.Module):
         axes[1].scatter(pt2[1], pt2[0], c="r", s=4, label="pt2", alpha=pt2_vis)
         plt.show()
 
-    def loss(self, x1, x2, pts1, pts2, valid2, cld2):
-        assert torch.all(valid2), "valid2 should be all True for now"
+    def loss(self, x1, x2, pts1, pts2, valid2, cld2, sigma=0.1):
+        """loss function for feature matching, including precision and misdetection
+        ---
+        x1, x2: (B, 3, H, W), elements in [0, 1] instead of [0, 255]
+        pts1, pts2: (B, L, 2)
+        valid2: (B, L), boolean
+        cld2: (B, H, W, 3)
+        sigma: float, sigma=0 for hard label (point distrib), >0 for soft label (3D Gaussian distrib), recommended schedule when training from scratch: 0.5-0.3-0.1-0.05 
+        return
+            loss: scalar
+        """
+        # assert torch.all(valid2), "valid2 should be all True for now"
         logits = self.forward(x1, x2, pts1)
+        dev = x1.device
         B, L, H, W = logits.shape
+        logits_m = logits[valid2]  # (B, L, H, W) -> (N1, H, W)
+        logits_um = logits[~valid2]  # (B, L, H, W) -> (N2, H, W)
+
+        """ Part 1: loss for regression precision """
         # get distance
         cld = cld2.view(B, H * W, 3)
         idx = pts2[..., 0] * W + pts2[..., 1]
         pts3d = cld.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
-        dist = torch.norm(cld2.view(B, 1, H*W, 3) - pts3d.view(B, L, 1, 3), dim=-1)
+        dist = torch.norm(cld2.view(B, 1, H * W, 3) - pts3d.view(B, L, 1, 3), dim=-1)
+        # select valid points
+        pts = pts2.view(B * L, 2)[valid2.view(-1)]  # (B, L, 2) -> (N1, 2)
+        dist = dist.view(B * L, H, W)[valid2.view(-1)]  # (B, L, H, W) -> (N1, H, W)
         # get distribution of pts2
-        distrib = self.get_distrib(pts2, H, W, sigma=0.3, dist=dist)
-        # loss
-        loss = F.cross_entropy(logits.view(B * L, H * W), distrib.view(B * L, H * W))
-        return loss
+        distrib = self.get_distrib(pts, H, W, sigma=0.05, dist=dist)
+        loss_prec = F.cross_entropy(logits_m.view(-1, H * W), distrib.view(-1, H * W))
+
+        """ Part 2: loss for misdetection """
+        # get invalid points (unmatched case)
+        max_um = torch.max(logits_um.flatten(-2), dim=-1)[0]
+        max_m = torch.max(logits_m.flatten(-2), dim=-1)[0]
+        loss_misdet = (F.relu(max_um - 0).sum() + F.relu(10 - max_m).sum()) / (B * L)
+
+        # valid_pred = torch.max(logits.flatten(-2), dim=-1)[0] > 0
+        # print(
+        #     f"incorrect validity prediction: {torch.bitwise_xor(valid_pred, valid2).sum()}"
+        # )
+
+        return loss_prec + loss_misdet
 
     @staticmethod
     def get_distrib(pts, H, W, sigma=0, dist=None):
@@ -287,25 +315,31 @@ def main():
         print("weights not found. fresh train.")
     # train
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    for epoch in range(1000):
+    schedule = [[1000, 0.5], [2000, 0.3], [3000, 0.1], [5000, 0.05]]
+    for epoch in range(7000):
         optimizer.zero_grad()
+        # get scheduled sigma
+        for (e, s) in schedule:
+            if epoch < e:
+                break
+        # Batch Gradient Descent
         for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
-            loss = model.loss(x1, x2, pts1, pts2, valid2, cld2)
+            loss = model.loss(x1, x2, pts1, pts2, valid2, cld2, s)
             loss.backward()
         optimizer.step()
         if epoch % 20 == 0:
             print(f"\tepoch {epoch} loss: {loss.item():.5f}")
         if (epoch + 1) % 200 == 0:
-            model.visualize(x1, x2, pts1, pts2, valid2)
+            # model.visualize(x1, x2, pts1, pts2, valid2)
             torch.save(model.state_dict(), "fuck.pt")
 
 
 def test():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
-    H, W = 480, 640
-    L = 100
-    B = 2
+    H, W = 240, 480
+    L = 10
+    B = 1
     model = FeatMatchNN()
     x1 = torch.rand(B, 3, H, W)
     x2 = torch.rand(B, 3, H, W)
