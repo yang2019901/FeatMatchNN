@@ -125,34 +125,40 @@ def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
 
 
 # Note: distance noise gets larger when obj is further, here we use a ratio `k_tol`: (p1 - p2) < (norm(p1) + norm(p2)) * k_tol
-def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, k_tol=0.03):
-    """generate boolean mask of matched points, using distance threshold
-    ---
-    m_pts1, m_pts2: (L1, 2), int
-    um_pts1: (L2, 2), int
+def autocheck(pts1, cld1_glb, cld2_glb, k_tol=0.01):
+    """
+    pts1: (L, 2), int
     cld1_glb, cld2_glb: (H, W, 3), float32
 
     return:
-        matched: (L1, ), bool
-        unmatched: (L2, ), bool
+        pts2: (L, 2), int
+        valid2: (L,), bool
     """
+    H, W = cld1_glb.shape[:2]
+    L = pts1.shape[0]
     dist1 = torch.norm(cld1_glb, dim=-1)  # (H, W)
     dist2 = torch.norm(cld2_glb, dim=-1)  # (H, W)
-    err1 = torch.norm(
-        cld1_glb[m_pts1[:, 1], m_pts1[:, 0]] - cld2_glb[m_pts2[:, 1], m_pts2[:, 0]],
-        dim=-1,
-    )
-    err1_tol = dist1[m_pts1[:, 1], m_pts1[:, 0]] + dist2[m_pts2[:, 1], m_pts2[:, 0]]
-    matched = err1 < err1_tol * k_tol
-    if um_pts1 is None:
-        return matched, None
-    err2 = torch.norm(
-        cld1_glb[um_pts1[:, 1], um_pts1[:, 0]].view(-1, 1, 3) - cld2_glb.view(1, -1, 3),
-        dim=-1,
-    )  # (L2, H*W)
-    err2_tol = dist1[um_pts1[:, 1], um_pts1[:, 0]].view(-1, 1) + dist2.view(1, -1)
-    unmatched = torch.min(err2 / err2_tol, dim=-1)[0] > k_tol
-    return matched, unmatched
+    pts1_3d = cld1_glb[pts1[:, 0], pts1[:, 1]]  # (L, 3)
+    err = torch.norm(
+        cld2_glb.view(1, H * W, 3) - pts1_3d.view(L, 1, 3) + 1e-6, dim=-1
+    )  # (L, H*W)
+    k_err = err / (
+        dist1[pts1[:, 0], pts1[:, 1]].view(L, 1) + dist2.view(1, -1) + 1e-6
+    )  # (L, H*W)
+    min_k_err, idx = torch.min(k_err, dim=-1)
+    pts2 = torch.stack([idx // W, idx % W], dim=-1)
+    valid2 = min_k_err < k_tol
+
+    i = 0
+    _, axes = plt.subplots(1, 2, figsize=(8, 4))
+    axes[0].imshow(cld1_glb[..., 2])
+    # axes[1].imshow(cld2_glb[..., 2])
+    axes[1].imshow(k_err[i].view(H, W).cpu().numpy())
+    axes[0].scatter(pts1[i, 1], pts1[i, 0], c="r", s=4)
+    axes[1].scatter(pts2[i, 1], pts2[i, 0], c="r", s=4)
+    plt.show()
+
+    return pts2, valid2
 
 
 def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
@@ -197,40 +203,18 @@ def MakeDataset(imgs, clds, poses, L):
     # extract features
     dev = torch.device("cuda:0")
     extractor = SuperPoint(max_num_keypoints=4 * L).to(dev)
-    matcher = LightGlue(features="superpoint").eval().to(dev)
     feats = [extractor.extract(X[i].to(dev)) for i in range(N)]
     # match
     frames = []
     for i in range(1, N):
         feat1, cld1, pose1 = feats[0], clds[0], poses[0]
         feat2, cld2, pose2 = feats[i], clds[i], poses[i]
-        matches12 = matcher({"image0": feat1, "image1": feat2})
-        feat1, feat2, matches12 = rbd(feat1), rbd(feat2), rbd(matches12)
-        uv1, uv2, matches = (
-            feat1["keypoints"].to("cpu"),
-            feat2["keypoints"].to("cpu"),
-            matches12["matches"].to("cpu"),
-        )
-        m_uv1 = uv1[matches[..., 0]].to(torch.int64)
-        m_uv2 = uv2[matches[..., 1]].to(torch.int64)
-        um_uv1 = uv1[[i for i in range(len(uv1)) if i not in matches[..., 0]]].to(
-            torch.int64
-        )
-        viz2d.plot_images((X[0], X[i]))
-        viz2d.plot_matches(m_uv1, m_uv2, color="lime", lw=0.4)
-        viz2d.plot_keypoints([um_uv1], ps=6)
-        plt.show()
+        pts1 = feat1["keypoints"].to("cpu", dtype=int).flip([-1]).view(-1, 2)
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
-        correct_m, correct_um = autocheck(m_uv1, m_uv2, um_uv1, cld1_glb, cld2_glb)
-        try:
-            uv1, uv2, valid2 = sample(
-                m_uv1[correct_m], m_uv2[correct_m], um_uv1[correct_um], L
-            )
-        except:
-            continue
-        # flip last dim of uv to fit the format of torch.tensor
-        pts1, pts2 = uv1.flip([-1]), uv2.flip([-1])
+        pts2, valid2 = autocheck(pts1, cld1_glb, cld2_glb)
+        pts1, pts2, valid2 = sample(pts1[valid2], pts2[valid2], pts1[~valid2], L)
         frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
+        viz_frame(frames[-1])
     print(f"{N-1} pairs of images are processed.")
     return frames
 

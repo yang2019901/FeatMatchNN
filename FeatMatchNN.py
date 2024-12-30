@@ -248,7 +248,7 @@ class FeatMatchNN(nn.Module):
         # get invalid points (unmatched case)
         max_um = torch.max(logits_um.flatten(-2), dim=-1)[0]
         max_m = torch.max(logits_m.flatten(-2), dim=-1)[0]
-        loss_misdet = (F.relu(max_um - 0).sum() + F.relu(10 - max_m).sum()) / (B * L)
+        loss_misdet = (F.relu(max_um - 0).sum() + F.relu(20 - max_m).sum()) / (B * L)
 
         # valid_pred = torch.max(logits.flatten(-2), dim=-1)[0] > 0
         # print(
