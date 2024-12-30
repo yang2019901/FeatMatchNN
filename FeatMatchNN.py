@@ -5,15 +5,88 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from torchinfo import summary
 
-import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable, inset_locator
 import os
+
+import matplotlib.pyplot as plt
+import matplotlib.patches
+from mpl_toolkits.axes_grid1 import make_axes_locatable, inset_locator
+
+import cv2
+import numpy as np
 
 
 def viz_frame(frame):
     from DataProcess import viz_frame
 
     viz_frame(frame)
+
+
+def viz_featmap(featmap: torch.Tensor, title="", pts=None):
+    # featmap: (H, W)
+    fig, ax = plt.subplots()
+    cbar = fig.colorbar(
+        ax.imshow(featmap.cpu().detach()), ax=ax, orientation="vertical"
+    )
+    if pts is not None:
+        p = pts.cpu().detach()
+        ax.scatter(p[..., 1], p[..., 0], c="r", s=4)
+    fig.suptitle(title)
+
+
+def Img2Tensor(img):
+    # img: (B, H, W, 3), np.uint8
+    return torch.tensor(img).permute(0, 3, 1, 2) / 255
+
+
+def Tensor2Img(x):
+    # x: (B, 3, H, W), torch.float32, 0~1
+    return (x * 255).permute(0, 2, 3, 1).cpu().detach().numpy().astype(np.uint8)
+
+
+class MatchPointFigure:
+    def __init__(self, img1, img2):
+        self.H, self.W = img1.shape[:2]
+        self.fig, self.axes = plt.subplots(
+            1, 2, figsize=(4.5 * 2 * self.W / self.H, 4.5)
+        )
+        self.axes[0].imshow(img1)
+        self.axes[1].imshow(img2)
+        self.p1 = plt.Circle([0, 0], 1, color="r")
+        self.p2 = plt.Circle([0, 0], 1, color="r")
+        self.conn = matplotlib.patches.ConnectionPatch(
+            xyA=(0, 0),
+            xyB=(0, 0),
+            coordsA=self.axes[0].transData,
+            coordsB=self.axes[1].transData,
+            color="r",
+        )
+        self.heatmap = None
+        # add artists to figure
+        self.axes[0].add_artist(self.p1)
+        self.axes[1].add_artist(self.p2)
+        self.fig.add_artist(self.conn)
+        self.p1.set_visible(False)
+        self.p2.set_visible(False)
+        self.conn.set_visible(False)
+        return
+
+    def refresh(self, m_uv1, m_uv2, valid, heatmap=None, suptitle=None):
+        self.p1.set_visible(True)
+        self.p2.set_visible(valid)
+        self.conn.set_visible(valid)
+        self.p1.center = m_uv1
+        if valid:
+            self.p2.center = m_uv2
+            self.conn.xy1 = m_uv1
+            self.conn.xy2 = m_uv2
+        if heatmap is not None:
+            if self.heatmap is None:
+                self.heatmap = self.axes[1].imshow(heatmap, alpha=0.5, cmap="jet")
+            else:
+                self.heatmap.set_array(heatmap)
+        if suptitle is not None:
+            self.fig.suptitle(suptitle)
+        self.fig.canvas.draw()
 
 
 class FeatMatchDataset(torch.utils.data.Dataset):
@@ -56,7 +129,6 @@ class FeatMatchDataset(torch.utils.data.Dataset):
                         brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5
                     ),
                     v2.GaussianBlur(3),
-                    v2.GaussianNoise(mean=0, sigma=0.03),
                 ]
             )
         )
@@ -75,6 +147,8 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         )
         # Note: the same transform for x1 and x2
         x1, x2 = self.transforms(torch.stack([x1, x2]))
+        x1 = v2.functional.gaussian_noise(x1, mean=0, sigma=0.02)
+        x2 = v2.functional.gaussian_noise(x2, mean=0, sigma=0.02)
         return x1, x2, pts1, pts2, valid2, cld2
 
 
@@ -84,7 +158,7 @@ class FeatMatchNN(nn.Module):
     Note: all input and output are torch.Tensor
     """
 
-    def __init__(self):
+    def __init__(self, device):
         super(FeatMatchNN, self).__init__()
         c1, c2, c3, c4, c5 = 3, 4, 8, 16, 16
         # Note whether receptive field is large enough. See https://blog.csdn.net/Rolandxxx/article/details/127270974
@@ -106,11 +180,14 @@ class FeatMatchNN(nn.Module):
         )
         self.attns = {}
         self.feats = {}
+        self.thresh_valid = 10
+        self.device = device
+        self.to(device)
 
     def forward(self, x1, x2, pts1):
         """
-        x1, x2: (B, 3, H, W), elements in [0, 1] instead of [0, 255]
-        pts1: (B, L, 2)
+        x1, x2: (B, 3, H, W), float, 0~1
+        pts1: (B, L, 2), int
 
         return
             logits: (B, L, H, W), unscaled confidence map of x2, elements in (-inf, inf)
@@ -148,9 +225,9 @@ class FeatMatchNN(nn.Module):
             )
             attn = attn.view(B, Hi_, Wi_, L).permute(0, 3, 1, 2)  # (B, L, H, W)
 
-            # self.viz_featmap(attn[0, 90], "attn")
-            # self.viz_featmap(h2[0, 1], "h2")
-            # self.viz_featmap(h1[0, 1], "h1", pts[0, 90])
+            # viz_featmap(attn[0, 90], "attn")
+            # viz_featmap(h2[0, 1], "h2")
+            # viz_featmap(h1[0, 1], "h1", pts[0, 90])
             # plt.show()
 
             self.attns[i] = attn.reshape(B * L, 1, Hi_, Wi_)
@@ -172,55 +249,14 @@ class FeatMatchNN(nn.Module):
         logits = h2.view(B, L, H, W)
         return logits
 
-    @staticmethod
-    def viz_featmap(featmap: torch.Tensor, title="", pts=None):
-        # featmap: (H, W)
-        fig, ax = plt.subplots()
-        cbar = fig.colorbar(
-            ax.imshow(featmap.cpu().detach()), ax=ax, orientation="vertical"
-        )
-        if pts is not None:
-            p = pts.cpu().detach()
-            ax.scatter(p[..., 1], p[..., 0], c="r", s=4)
-        fig.suptitle(title)
-
-    def visualize(self, x1, x2, pts1, pts2, valid2):
-        logits = self.forward(x1, x2, pts1)
-        B, L, H, W = logits.shape
-        img1, img2 = x1[0].permute(1, 2, 0).cpu(), x2[0].permute(1, 2, 0).cpu()
-        pt1, pt2, pt2_vis = pts1[0, 0].cpu(), pts2[0, 0].cpu(), int(valid2[0, 0])
-        heatmap = (
-            F.softmax(logits[0, 0, :, :].view(H * W), dim=-1).view(H, W).cpu().detach()
-        )
-        fig, axes = plt.subplots(
-            1, 2, figsize=(4.5 * 2 * x1.shape[-1] / x1.shape[-2], 4.5)
-        )
-        axes[0].imshow(img1)
-        axes[1].imshow(img2)
-        img_heat = axes[1].imshow(heatmap, alpha=0.5, cmap="jet")
-        # divider = make_axes_locatable(axes[1])
-        # cax = inset_locator.inset_axes(
-        #     axes[1],
-        #     width="3%",
-        #     height="100%",
-        #     loc="lower left",
-        #     bbox_to_anchor=(1.05, 0.0, 1, 1),
-        #     bbox_transform=axes[1].transAxes,
-        #     borderpad=0,
-        # )
-        # cbar = fig.colorbar(img_heat, cax=cax, orientation="vertical")
-        axes[0].scatter(pt1[1], pt1[0], c="r", s=4, label="pt1")
-        axes[1].scatter(pt2[1], pt2[0], c="r", s=4, label="pt2", alpha=pt2_vis)
-        plt.show()
-
     def loss(self, x1, x2, pts1, pts2, valid2, cld2, sigma=0.1):
         """loss function for feature matching, including precision and misdetection
         ---
-        x1, x2: (B, 3, H, W), elements in [0, 1] instead of [0, 255]
-        pts1, pts2: (B, L, 2)
+        x1, x2: (B, 3, H, W), float, 0~1
+        pts1, pts2: (B, L, 2), int
         valid2: (B, L), boolean
         cld2: (B, H, W, 3)
-        sigma: float, sigma=0 for hard label (point distrib), >0 for soft label (3D Gaussian distrib), recommended schedule when training from scratch: 0.5-0.3-0.1-0.05 
+        sigma: float, sigma=0 for hard label (point distrib), >0 for soft label (3D Gaussian distrib), recommended schedule when training from scratch: 0.5-0.3-0.1-0.05
         return
             loss: scalar
         """
@@ -248,7 +284,9 @@ class FeatMatchNN(nn.Module):
         # get invalid points (unmatched case)
         max_um = torch.max(logits_um.flatten(-2), dim=-1)[0]
         max_m = torch.max(logits_m.flatten(-2), dim=-1)[0]
-        loss_misdet = (F.relu(max_um - 0).sum() + F.relu(10 - max_m).sum()) / (B * L)
+        loss_misdet = (
+            F.relu(max_um - 0).sum() + F.relu(self.thresh_valid - max_m).sum()
+        ) / (B * L)
 
         # valid_pred = torch.max(logits.flatten(-2), dim=-1)[0] > 0
         # print(
@@ -256,6 +294,92 @@ class FeatMatchNN(nn.Module):
         # )
 
         return loss_prec + loss_misdet
+
+    def viz_pred(self, x1, x2, pts1, pts2, valid2):
+        """
+        x1, x2: (3, H, W), float, 0~1
+        pts1, pts2: (L, 2), int
+        valid2: (L, ), bool
+        """
+        assert x1.dim() == 3 and x2.dim() == 3 and pts1.dim() == 2 and pts2.dim() == 2
+        H, W = x1.shape[-2:]
+        L = pts1.shape[-2]
+        logits = self.forward(x1.unsqueeze(0), x2.unsqueeze(0), pts1.unsqueeze(0))
+        heatmaps = F.softmax(logits.view(L, H * W), dim=-1).view(L, H, W).cpu().detach()
+        img1 = x1.permute(1, 2, 0).cpu().detach()
+        img2 = x2.permute(1, 2, 0).cpu().detach()
+        uv1 = pts1.cpu().detach().flip([-1])
+        uv2 = pts2.cpu().detach().flip([-1])
+        valid = valid2.cpu().detach()
+
+        mpfig = MatchPointFigure(img1, img2)
+        idx = 0
+        mpfig.refresh(
+            uv1[idx],
+            uv2[idx],
+            valid[idx],
+            heatmaps[idx],
+            f"Feature Matching Prediction {idx} / {L}",
+        )
+
+        def on_key(event):
+            nonlocal mpfig, idx
+            if event.key == "q":
+                plt.close()
+                return
+            if event.key == "n":
+                idx += 1 if idx < L - 1 else 0
+            elif event.key == "m":
+                idx -= 1 if idx > 0 else 0
+            mpfig.refresh(
+                uv1[idx],
+                uv2[idx],
+                valid[idx],
+                heatmaps[idx],
+                f"Feature Matching Prediction {idx} / {L}",
+            )
+
+        mpfig.fig.canvas.mpl_connect("key_press_event", on_key)
+        plt.show()
+
+    def match(self, img1, img2):
+        """match points in img1 to img2
+        img1, img2: (H, W, 3), np.uint8 or (3, H, W), torch.float32, 0~1
+        """
+        # if img1 is np array, convert to torch.Tensor
+        if isinstance(img1, np.ndarray):
+            H, W = img1.shape[:2]
+            x1 = Img2Tensor(img1).unsqueeze(0).to(self.device)
+            x2 = Img2Tensor(img2).unsqueeze(0).to(self.device)
+            mpfig = MatchPointFigure(img1, img2)
+        else:
+            H, W = img1.shape[-2:]
+            x1 = img1.unsqueeze(0).to(self.device)
+            x2 = img2.unsqueeze(0).to(self.device)
+            mpfig = MatchPointFigure(
+                img1.permute(1, 2, 0).cpu().detach(),
+                img2.permute(1, 2, 0).cpu().detach(),
+            )
+
+        def on_click(event):
+            nonlocal mpfig
+            if event.inaxes is None:
+                return
+            u1, v1 = int(event.xdata), int(event.ydata)
+            print(f"clicked: {u1}, {v1}", end="\t")
+            pts1 = torch.tensor([v1, u1]).view(1, 1, 2).to(self.device)
+            logits = self.forward(x1, x2, pts1).view(H * W).cpu().detach()
+            heatmap = F.softmax(logits, dim=-1).view(H, W)
+            idx = torch.argmax(logits)
+            u2, v2 = idx % W, idx // W
+            valid = logits.max() > self.thresh_valid / 2
+            mpfig.refresh(
+                (u1, v1), (u2, v2), valid, heatmap, "Feature Matching Prediction"
+            )
+            print(f"valid: {valid}")
+
+        mpfig.fig.canvas.mpl_connect("button_press_event", on_click)
+        plt.show()
 
     @staticmethod
     def get_distrib(pts, H, W, sigma=0, dist=None):
@@ -306,9 +430,9 @@ def main():
     # create dataset
     dataset = FeatMatchDataset(frames, H=128, W=128, dev=dev)
     # create dataloader
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
     # create model
-    model = FeatMatchNN().to(dev)
+    model = FeatMatchNN(dev)
     try:
         model.load_state_dict(torch.load("fuck.pt", weights_only=True))
     except:
@@ -319,25 +443,26 @@ def main():
     for epoch in range(7000):
         optimizer.zero_grad()
         # get scheduled sigma
-        for (e, s) in schedule:
+        for e, s in schedule:
             if epoch < e:
                 break
         # Batch Gradient Descent
         for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
             loss = model.loss(x1, x2, pts1, pts2, valid2, cld2, s)
             loss.backward()
+        # model.viz_pred(x1[0], x2[0], pts1[0], pts2[0], valid2[0])
+        model.match(x1[0], x2[0])
         optimizer.step()
         if epoch % 20 == 0:
             print(f"\tepoch {epoch} loss: {loss.item():.5f}")
         if (epoch + 1) % 200 == 0:
-            # model.visualize(x1, x2, pts1, pts2, valid2)
             torch.save(model.state_dict(), "fuck.pt")
 
 
 def test():
     # Note: ensure that H and W is power of 2
     torch.manual_seed(0)
-    H, W = 240, 480
+    H, W = 128, 128
     L = 10
     B = 1
     model = FeatMatchNN()
@@ -357,3 +482,11 @@ def test():
 if __name__ == "__main__":
     main()
     # test()
+
+    # img1 = cv2.imread("3.jpg")
+    # img2 = cv2.imread("4.jpg")
+    # img1 = cv2.resize(img1, (128, 128))
+    # img2 = cv2.resize(img2, (128, 128))
+
+    # model = FeatMatchNN("cpu")
+    # model.match(img1, img2)

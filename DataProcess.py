@@ -216,10 +216,10 @@ def MakeDataset(imgs, clds, poses, L):
         um_uv1 = uv1[[i for i in range(len(uv1)) if i not in matches[..., 0]]].to(
             torch.int64
         )
-        viz2d.plot_images((X[0], X[i]))
-        viz2d.plot_matches(m_uv1, m_uv2, color="lime", lw=0.4)
-        viz2d.plot_keypoints([um_uv1], ps=6)
-        plt.show()
+        # viz2d.plot_images((X[0], X[i]))
+        # viz2d.plot_matches(m_uv1, m_uv2, color="lime", lw=0.4)
+        # viz2d.plot_keypoints([um_uv1], ps=6)
+        # plt.show()
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
         correct_m, correct_um = autocheck(m_uv1, m_uv2, um_uv1, cld1_glb, cld2_glb)
         try:
@@ -231,6 +231,7 @@ def MakeDataset(imgs, clds, poses, L):
         # flip last dim of uv to fit the format of torch.tensor
         pts1, pts2 = uv1.flip([-1]), uv2.flip([-1])
         frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
+        viz_frame(frames[-1])
     print(f"{N-1} pairs of images are processed.")
     return frames
 
