@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 import open3d as o3d
 import os
+import numpy as np
 
 from LightGlue.lightglue import LightGlue, SuperPoint, viz2d
 from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
@@ -211,6 +212,21 @@ def MakeDataset(imgs, clds, poses, L):
         feat2, cld2, pose2 = feats[i], clds[i], poses[i]
         pts1 = feat1["keypoints"].to("cpu", dtype=int).flip([-1]).view(-1, 2)
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
+
+        # use open3d registration to fine-tune the pose
+        pcd1, pcd2 = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+        pcd1.points, pcd2.points = (
+            o3d.utility.Vector3dVector(cld1_glb.view(-1, 3).cpu().numpy()),
+            o3d.utility.Vector3dVector(cld2_glb.view(-1, 3).cpu().numpy()),
+        )
+        result = o3d.pipelines.registration.registration_icp(
+            pcd1, pcd2, 0.1, np.eye(4, dtype=np.float32), o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        )
+        pose = result.transformation
+        pos, rot = pose[0:3, 3], pose[0:3, 0:3]
+        cld1_glb = cld1_glb @ rot.T + pos
+        pcd1.points = o3d.utility.Vector3dVector(cld1_glb.view(-1, 3).cpu().numpy())
+
         pts2, valid2 = autocheck(pts1, cld1_glb, cld2_glb)
         pts1, pts2, valid2 = sample(pts1[valid2], pts2[valid2], pts1[~valid2], L)
         frames.append((X[0], X[i], pts1, pts2, valid2, clds[i]))
