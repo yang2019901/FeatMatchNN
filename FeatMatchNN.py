@@ -24,9 +24,7 @@ def viz_frame(frame):
 def viz_featmap(featmap: torch.Tensor, title="", pts=None):
     # featmap: (H, W)
     fig, ax = plt.subplots()
-    cbar = fig.colorbar(
-        ax.imshow(featmap.cpu().detach()), ax=ax, orientation="vertical"
-    )
+    cbar = fig.colorbar(ax.imshow(featmap.cpu().detach()), ax=ax, orientation="vertical")
     if pts is not None:
         p = pts.cpu().detach()
         ax.scatter(p[..., 1], p[..., 0], c="r", s=4)
@@ -46,9 +44,7 @@ def Tensor2Img(x):
 class MatchPointFigure:
     def __init__(self, img1, img2):
         self.H, self.W = img1.shape[:2]
-        self.fig, self.axes = plt.subplots(
-            1, 2, figsize=(4.5 * 2 * self.W / self.H, 4.5)
-        )
+        self.fig, self.axes = plt.subplots(1, 2, figsize=(4.5 * 2 * self.W / self.H, 4.5))
         self.axes[0].imshow(img1)
         self.axes[1].imshow(img2)
         self.p1 = plt.Circle([0, 0], 1, color="r")
@@ -101,9 +97,7 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         pts2 = torch.stack(pts2).to(dev)
         valid2 = torch.stack(valid2).to(dev)
         cld2 = torch.stack(cld2).to(dev)
-        x1, x2, cld2 = v2.functional.resize(
-            torch.stack([x1, x2, cld2.permute(0, 3, 1, 2)]), (self.H, self.W)
-        )
+        x1, x2, cld2 = v2.functional.resize(torch.stack([x1, x2, cld2.permute(0, 3, 1, 2)]), (self.H, self.W))
         cld2 = cld2.permute(0, 2, 3, 1)
         if self.H != H0:
             pts1[..., 0] = pts1[..., 0] * self.H // H0
@@ -125,9 +119,7 @@ class FeatMatchDataset(torch.utils.data.Dataset):
             if not augment
             else v2.Compose(
                 [
-                    v2.ColorJitter(
-                        brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5
-                    ),
+                    v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
                     v2.GaussianBlur(3),
                 ]
             )
@@ -303,9 +295,7 @@ class FeatMatchNN(nn.Module):
         # get invalid points (unmatched case)
         max_um = torch.max(logits_um.flatten(-2), dim=-1)[0]
         max_m = torch.max(logits_m.flatten(-2), dim=-1)[0]
-        loss_misdet = (
-            F.relu(max_um - 0).sum() + F.relu(self.thresh_valid - max_m).sum()
-        ) / (B * L)
+        loss_misdet = (F.relu(max_um - 0).sum() + F.relu(self.thresh_valid - max_m).sum()) / (B * L)
 
         # valid_pred = torch.max(logits.flatten(-2), dim=-1)[0] > 0
         # print(
@@ -392,9 +382,7 @@ class FeatMatchNN(nn.Module):
             idx = torch.argmax(logits)
             u2, v2 = idx % W, idx // W
             valid = logits.max() > self.thresh_valid / 2
-            mpfig.refresh(
-                (u1, v1), (u2, v2), valid, heatmap, "Feature Matching Prediction"
-            )
+            mpfig.refresh((u1, v1), (u2, v2), valid, heatmap, "Feature Matching Prediction")
             print(f"valid: {valid}")
 
         mpfig.fig.canvas.mpl_connect("button_press_event", on_click)
@@ -429,11 +417,7 @@ class FeatMatchNN(nn.Module):
             distrib = torch.exp(-dist.view(N, H, W) / (2 * sigma**2))
             distrib = distrib / torch.sum(distrib, dim=(1, 2), keepdim=True)
         else:
-            raise (
-                ValueError(
-                    "sigma should be non-negative; 0 for hard label, >0 for soft label (Gaussian)"
-                )
-            )
+            raise (ValueError("sigma should be non-negative; 0 for hard label, >0 for soft label (Gaussian)"))
         pts = pts.view(*batch_dims, 2)
         return distrib.view(*batch_dims, H, W)
 
