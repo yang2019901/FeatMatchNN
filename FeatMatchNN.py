@@ -147,8 +147,8 @@ class FeatMatchDataset(torch.utils.data.Dataset):
         )
         # Note: the same transform for x1 and x2
         x1, x2 = self.transforms(torch.stack([x1, x2]))
-        x1 = v2.functional.gaussian_noise(x1, mean=0, sigma=0.02)
-        x2 = v2.functional.gaussian_noise(x2, mean=0, sigma=0.02)
+        x1 = v2.functional.gaussian_noise(x1, mean=0, sigma=0.01)
+        x2 = v2.functional.gaussian_noise(x2, mean=0, sigma=0.01)
         return x1, x2, pts1, pts2, valid2, cld2
 
 
@@ -170,14 +170,34 @@ class FeatMatchNN(nn.Module):
                 nn.Conv2d(c4, c5, kernel_size=5, padding=2),
             ]
         )
+        # Kq
+        self.Kq = nn.ModuleList(
+            [
+                nn.Linear(c2, 2 * c2),
+                nn.Linear(c3, 2 * c3),
+                nn.Linear(c4, 2 * c4),
+                nn.Linear(c5, 2 * c5),
+            ]
+        )
+        # Kv
+        self.Kv = nn.ModuleList(
+            [
+                nn.Linear(c2, 2 * c2),
+                nn.Linear(c3, 2 * c3),
+                nn.Linear(c4, 2 * c4),
+                nn.Linear(c5, 2 * c5),
+            ]
+        )
+
         self.conv_dec = nn.ModuleList(
             [
                 nn.Conv2d(2 * c5 + 1, c4, kernel_size=3, padding=1),
                 nn.Conv2d(2 * c4 + 1, c3, kernel_size=3, padding=1),
                 nn.Conv2d(2 * c3 + 1, c2, kernel_size=3, padding=1),
-                nn.Conv2d(2 * c2 + 1, 1, kernel_size=3, padding=1),
+                nn.Conv2d(2 * c2 + 1, c1, kernel_size=3, padding=1),
             ]
         )
+        self.conv_output = nn.Conv2d(c1, 1, kernel_size=3, padding=1)
         self.attns = {}
         self.feats = {}
         self.thresh_valid = 10
@@ -217,13 +237,12 @@ class FeatMatchNN(nn.Module):
             query = h1.view(B, Ci_, Hi_ * Wi_).gather(
                 2, (pts[:, :, 0] * Wi_ + pts[:, :, 1]).unsqueeze(1).expand(-1, Ci_, -1)
             )
-
-            attn = F.cosine_similarity(
-                h2.view(B, Ci_, Hi_ * Wi_, 1).permute(0, 2, 3, 1),
-                query.permute(0, 2, 1).unsqueeze(1),
-                dim=-1,
+            attn = torch.einsum(
+                "blc,bhwc->blhw",
+                self.Kq[i](query.permute(0, 2, 1)),
+                self.Kv[i](h2.permute(0, 2, 3, 1)),
             )
-            attn = attn.view(B, Hi_, Wi_, L).permute(0, 3, 1, 2)  # (B, L, H, W)
+            # attn = F.softmax(attn.view(B*L, -1), dim=-1)
 
             # viz_featmap(attn[0, 90], "attn")
             # viz_featmap(h2[0, 1], "h2")
@@ -244,9 +263,9 @@ class FeatMatchNN(nn.Module):
             feat = self.feats[idx].repeat(L, 1, 1, 1)
             h2 = torch.concat([h2, feat], dim=1)
             # Conv-ReLU
-            h2 = F.leaky_relu(layer(h2)) if i < len(self.conv_dec) - 1 else layer(h2)
-        # h2: (B*L, 1, H, W) -> (B, L, H, W)
-        logits = h2.view(B, L, H, W)
+            h2 = F.leaky_relu(layer(h2))
+        # output layer
+        logits = self.conv_output(h2).view(B, L, H, W)
         return logits
 
     def loss(self, x1, x2, pts1, pts2, valid2, cld2, sigma=0.1):
@@ -440,7 +459,7 @@ def main():
     # train
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     schedule = [[1000, 0.5], [2000, 0.3], [3000, 0.1], [5000, 0.05]]
-    for epoch in range(7000):
+    for epoch in range(3000):
         optimizer.zero_grad()
         # get scheduled sigma
         for e, s in schedule:
@@ -450,6 +469,7 @@ def main():
         for x1, x2, pts1, pts2, valid2, cld2 in dataloader:
             loss = model.loss(x1, x2, pts1, pts2, valid2, cld2, s)
             loss.backward()
+            break
         # model.viz_pred(x1[0], x2[0], pts1[0], pts2[0], valid2[0])
         model.match(x1[0], x2[0])
         optimizer.step()
@@ -475,7 +495,6 @@ def test():
     valid2 = torch.rand(B, L) > 0.5
     cld2 = torch.rand(B, H, W, 3)
     summary(model, input_data=(x1, x2, pts1))
-    # loss = model.p2map_loss(x1, x2, pts1, pts2, valid2, cld2)
     # print(loss)
 
 

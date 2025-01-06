@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 import open3d as o3d
 import os
+import numpy as np
 
 from LightGlue.lightglue import LightGlue, SuperPoint, viz2d
 from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
@@ -39,6 +40,25 @@ def transform(cld, pose):
     R = quat2mat(pose[1])
     cld_glb = cld @ R.T + t
     return cld_glb
+
+
+def fine_registration(cld1, cld2):
+    # use open3d registration to fine-tune the pose
+    pcd1, pcd2 = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+    pcd1.points, pcd2.points = (
+        o3d.utility.Vector3dVector(cld1.view(-1, 3).numpy()),
+        o3d.utility.Vector3dVector(cld2.view(-1, 3).numpy()),
+    )
+    result = o3d.pipelines.registration.registration_icp(
+        pcd1,
+        pcd2,
+        0.1,
+        np.eye(4, dtype=np.float32),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+    )
+    pose = result.transformation
+    pos, rot = pose[0:3, 3], pose[0:3, 0:3]
+    return cld1 @ rot.T + pos, cld2
 
 
 def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
@@ -125,7 +145,7 @@ def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
 
 
 # Note: distance noise gets larger when obj is further, here we use a ratio `k_tol`: (p1 - p2) < (norm(p1) + norm(p2)) * k_tol
-def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, k_tol=0.03):
+def autocheck(m_pts1, m_pts2, um_pts1, cld1_glb, cld2_glb, k_tol=0.02):
     """generate boolean mask of matched points, using distance threshold
     ---
     m_pts1, m_pts2: (L1, 2), int
@@ -221,6 +241,7 @@ def MakeDataset(imgs, clds, poses, L):
         # viz2d.plot_keypoints([um_uv1], ps=6)
         # plt.show()
         cld1_glb, cld2_glb = transform(cld1, pose1), transform(cld2, pose2)
+        cld1_glb, cld2_glb = fine_registration(cld1_glb, cld2_glb)
         correct_m, correct_um = autocheck(m_uv1, m_uv2, um_uv1, cld1_glb, cld2_glb)
         try:
             uv1, uv2, valid2 = sample(
