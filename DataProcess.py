@@ -42,6 +42,25 @@ def transform(cld, pose):
     return cld_glb
 
 
+def fine_registration(cld1, cld2):
+    # use open3d registration to fine-tune the pose
+    pcd1, pcd2 = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+    pcd1.points, pcd2.points = (
+        o3d.utility.Vector3dVector(cld1.view(-1, 3).numpy()),
+        o3d.utility.Vector3dVector(cld2.view(-1, 3).numpy()),
+    )
+    result = o3d.pipelines.registration.registration_icp(
+        pcd1,
+        pcd2,
+        0.1,
+        np.eye(4, dtype=np.float32),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+    )
+    pose = result.transformation
+    pos, rot = pose[0:3, 3], pose[0:3, 0:3]
+    return cld1 @ rot.T + pos, cld2
+
+
 def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
     """draw the matched points one by one and manually confirm them"""
     ratio = 4 / 3
