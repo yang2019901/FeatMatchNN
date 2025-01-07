@@ -13,13 +13,12 @@ from LightGlue.lightglue.utils import rbd, numpy_image_to_torch
 from scipy.spatial.transform import Rotation
 
 
-cam_in = torch.Tensor(
-    [
-        [606.9916381835938, 0.0, 317.2601623535156],
-        [0.0, 605.5125732421875, 241.97413635253906],
-        [0.0, 0.0, 1.0],
-    ]
-).to(torch.float32)
+## unity camera intrinsics
+fov = 60 * np.pi / 180
+h, w = 256, 256
+fx, fy = w / (2 * np.tan(fov / 2)), h / (2 * np.tan(fov / 2))
+cx, cy = w / 2, h / 2
+cam_in = torch.Tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]).to(torch.float32)
 
 
 def transform(cld, mat_pose):
@@ -43,123 +42,13 @@ def pose2mat(pose):
     return M
 
 
-def mat2pose(M):
-    """convert transformation matrix to pose
-    M: (4, 4), float32
-
-    return:
-        pose: [[x, y, z], [qx, qy, qz, qw]]
-    """
-    t, R = M[:3, 3], M[:3, :3]
-    q = Rotation.from_matrix(R).as_quat()
-    return [t, q]
-
-
-def fine_registration(cld1, cld2):
-    """use open3d registration to fine-tune cld1 to fit cld2"""
-    pcd1, pcd2 = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
-    pcd1.points, pcd2.points = (
-        o3d.utility.Vector3dVector(cld1.view(-1, 3).numpy()),
-        o3d.utility.Vector3dVector(cld2.view(-1, 3).numpy()),
-    )
-    result = o3d.pipelines.registration.registration_icp(
-        pcd1,
-        pcd2,
-        0.1,
-        np.eye(4, dtype=np.float32),
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-    )
-    pcd1.transform(result.transformation)
-    print("transform: \n", result.transformation)
-    cld1 = torch.tensor(pcd1.points, dtype=torch.float32).view(cld1.shape)
-    return cld1, cld2
-
-
-def confirm(x1, x2, m_pts1, m_pts2, um_pts1=None):
-    """draw the matched points one by one and manually confirm them"""
-    ratio = 4 / 3
-    fig, axes = plt.subplots(1, 2, figsize=(2 * ratio * 4.5, 4.5))
-    axes[0].imshow(x1.permute(1, 2, 0).cpu().numpy())
-    axes[0].axis("off")
-    axes[1].imshow(x2.permute(1, 2, 0).cpu().numpy())
-    axes[1].axis("off")
-    l1 = m_pts1.shape[0]
-    l2 = um_pts1.shape[0] if um_pts1 is not None else 0
-    # draw matched points
-    axes[0].scatter(m_pts1[:, 0], m_pts1[:, 1], c="g", s=4)
-    axes[1].scatter(m_pts2[:, 0], m_pts2[:, 1], c="g", s=4)
-    for i in range(l1):
-        conn = matplotlib.patches.ConnectionPatch(
-            xyA=m_pts1[i],
-            xyB=m_pts2[i],
-            coordsA=axes[0].transData,
-            coordsB=axes[1].transData,
-            color="g",
-        )
-        fig.add_artist(conn)
-    # draw unmatched points
-    axes[0].scatter(um_pts1[:, 0], um_pts1[:, 1], c="b", s=4)
-    # draw indicator
-    c1 = plt.Circle(m_pts1[0], 3, color="r")
-    c2 = plt.Circle(m_pts2[0], 3, color="r")
-    conn = matplotlib.patches.ConnectionPatch(
-        xyA=m_pts1[0],
-        xyB=m_pts2[0],
-        coordsA=axes[0].transData,
-        coordsB=axes[1].transData,
-        color="r",
-    )
-    axes[0].add_artist(c1)
-    axes[1].add_artist(c2)
-    fig.add_artist(conn)
-    # indicator and data
-    idx = 0
-    correct = torch.zeros(l1 + l2, dtype=torch.bool)  # whether lightglue is correct
-    fig.suptitle(f"idx: {idx} / ({l1} + {l2})")
-    fig.tight_layout(pad=0)
-
-    def on_key(event):
-        """
-        n/m: next/previous point pair;
-        j/k: accept/reject the current point pair
-        """
-        nonlocal idx, c1, c2, conn, correct
-        if event.key == "q":
-            plt.close()
-            return
-        correct[idx] = 1 if event.key == "j" else (0 if event.key == "k" else correct[idx])
-        # change idx
-        if event.key == "n" or event.key == "j" or event.key == "k":
-            idx += 1
-        elif event.key == "m" and idx > 0:
-            idx -= 1
-        if idx >= l1 + l2:
-            plt.close()
-            return
-        # update drawing
-        fig.suptitle(f"idx: {idx} / ({l1} + {l2})")
-        c1.center = m_pts1[idx] if idx < l1 else um_pts1[idx - l1]
-        c2.set_visible(idx < l1)
-        conn.set_visible(idx < l1)
-        if idx < l1:
-            c2.center = m_pts2[idx]
-            conn.xy1 = m_pts1[idx]
-            conn.xy2 = m_pts2[idx]
-        fig.canvas.draw()
-
-    fig.canvas.mpl_connect(
-        "key_press_event",
-        on_key,
-    )
-    plt.show()
-    print("lightglue correct: ", correct)
-    return correct[:l1], correct[l1:]
-
-
-def annotate(pts1, cld1, cld2, cam_in, k_tol=0.02):
+def annotate(pts1, cld1, cld2, cam_in, k_tol=0.01):
     """auto-annotate the matched points with imaging principle
     pts1: (L, 2), int
     cld1: (H, W, 3), float32
+    cld2: (H, W, 3), float32
+    cam_in: (3, 3), float32
+    k_tol: float, tolerance ratio of the distance between the projected point and the nearest point
 
     return:
         pts2: (L, 2), int
@@ -167,22 +56,45 @@ def annotate(pts1, cld1, cld2, cam_in, k_tol=0.02):
     """
     H, W = cld1.shape[:2]
     L = pts1.shape[0]
-    # project 3d points to 2d
+    ## project 3d points to 2d
     pts1_3d = cld1[pts1[:, 0], pts1[:, 1]].T  # (3, L)
     uv2 = (cam_in @ (pts1_3d / pts1_3d[2, :]))[:2]  # (2, L)
-    pts2 = uv2.T.flip([-1]).round().to(torch.int)
+    pts2_f = uv2.T.flip([-1])  # (L, 2)
 
+    ## floor/ceil x/y and get the nearest among 4 points
+    pts2_fx_fy = pts2_f.floor().to(torch.int)
+    pts2_cy_cy = pts2_f.ceil().to(torch.int)
+    pts2_fx_cy = torch.stack([pts2_fx_fy[:, 0], pts2_cy_cy[:, 1]], dim=-1)
+    pts2_cx_fy = torch.stack([pts2_cy_cy[:, 0], pts2_fx_fy[:, 1]], dim=-1)
+    ## four corners of the nearest 4 points
+    pts2_cnrs = torch.stack([pts2_fx_fy, pts2_cy_cy, pts2_fx_cy, pts2_cx_fy], dim=1)  # (L, 4, 2)
+    pts2_cnrs.clamp_(
+        torch.zeros(1, 1, 2, dtype=torch.int), max=torch.tensor([[[H - 1, W - 1]]], dtype=torch.int)
+    )  # (L, 4, 2)
+    pts2_cnrs = W * pts2_cnrs[:, :, 0] + pts2_cnrs[:, :, 1]  # (L, 4)
+
+    pts2 = torch.zeros(L, dtype=torch.int)
     valid2 = np.zeros(L, dtype=bool)
+    cld2 = cld2.view(-1, 3)
     for i in range(L):
-        # in view
-        if not (0 <= pts2[i, 0] < H and 0 <= pts2[i, 1] < W):
-            continue
-        valid2[i] = True
-        p1, p2 = pts1_3d[:, i], cld2[pts2[i, 0], pts2[i, 1]]
-        # not occluded, checked by distance
-        valid2[i] = torch.norm(p1 - p2) < k_tol * torch.norm(p1)
+        p0 = pts1_3d[:, i]
+        p = cld2[pts2_cnrs[i], :]
+        dist = torch.norm(p - p0, dim=-1)
+        min_dist, min_idx = torch.min(dist, dim=0)
+        valid2[i] = min_dist < k_tol * torch.norm(p0)
+        pts2[i] = pts2_cnrs[i, min_idx]
+    pts2 = torch.stack([pts2 // W, pts2 % W], dim=-1)
 
     return pts2, valid2
+
+
+def tensor2pcd(cld, rgb):
+    """cld: (H, W, 3), float32"""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(cld.reshape(-1, 3))
+    if rgb is not None:
+        pcd.colors = o3d.utility.Vector3dVector(rgb.reshape(-1, 3))
+    return pcd
 
 
 def sample(m_pts1, m_pts2, um_pts1, L, k_valid=0.8):
@@ -221,11 +133,11 @@ def MakeDataset(imgs, clds, poses, L):
     clds = clds.to(torch.float32)
     X = imgs.permute(0, 3, 1, 2) / 255.0  # (N, H, W, 3) -> (N, 3, H, W), range: [0, 255] -> [0, 1]
     N, _, H, W = X.shape
-    # extract features
+    ## extract features
     dev = torch.device("cuda:0")
     extractor = SuperPoint(max_num_keypoints=4 * L).to(dev)
     feats = [extractor.extract(X[i].to(dev)) for i in range(N)]
-    # match
+    ## match
     frames = []
     for i in range(1, N):
         feat1, cld1, pose1 = feats[0], clds[0], poses[0]
@@ -233,7 +145,6 @@ def MakeDataset(imgs, clds, poses, L):
         pts1 = feat1["keypoints"].to("cpu", dtype=int).flip([-1]).view(-1, 2)
         M1, M2 = pose2mat(pose1), pose2mat(pose2)
         cld1 = transform(cld1, inv(M2) @ M1)
-        cld1, cld2 = fine_registration(cld1, cld2)
         pts2, valid2 = annotate(pts1, cld1, cld2, cam_in)
         viz_frame((X[0], X[i], pts1, pts2, valid2, cld2))
         pts1, pts2, valid2 = sample(pts1[valid2], pts2[valid2], pts1[~valid2], L)
